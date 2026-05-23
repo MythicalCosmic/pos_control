@@ -1,0 +1,30 @@
+__pycache__/
+*.py[cod]
+*$py.class
+
+*.so
+.Python
+.venv/
+venv/
+env/
+ENV/
+
+# SQLite + Django runtime artefacts
+db.sqlite3
+db.sqlite3-journal
+staticfiles/
+media/
+
+# Secrets
+.env
+.env.local
+
+# Editors
+.idea/
+.vscode/
+*.swp
+
+# pytest / coverage
+.pytest_cache/
+.coverage
+htmlcov/

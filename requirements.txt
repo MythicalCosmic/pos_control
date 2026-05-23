@@ -1,0 +1,9 @@
+Django==6.0.3
+asgiref==3.11.1
+sqlparse==0.5.5
+psycopg2-binary==2.9.10
+gunicorn==23.0.0
+# Used to verify Ed25519 perpetual-unlock signatures (vendor side
+# generates them; alpha_pos verifies them). cryptography already
+# brings ed25519 primitives.
+cryptography==48.0.0
