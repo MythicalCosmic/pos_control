@@ -301,3 +301,253 @@ class TestHeartbeatRecording:
         resp = _heartbeat(key, body='this is a string')  # type: ignore[arg-type]
         # heartbeat() requires a dict; pass a list directly to exercise
         # the json.loads -> dict guard.
+
+
+# ---------------------------------------------------------------------------
+# Admin bulk actions + ControlEvent audit trail
+# ---------------------------------------------------------------------------
+
+
+def _staff_user(db):
+    from django.contrib.auth.models import User
+    return User.objects.create_user(
+        username='staff', password='pw', is_staff=True, is_superuser=True,
+    )
+
+
+def _staff_client(user):
+    """Django test client logged in as `user`. Uses force_login because
+    we don't care about exercising the auth form — just admin actions."""
+    c = Client()
+    c.force_login(user)
+    return c
+
+
+def _issue_active_key():
+    from licenses.models import LicenseKey
+    from tenants.models import Tenant
+    t = Tenant.objects.create(org_name='Café X', email='x@x.local')
+    row, _key = LicenseKey.issue(t)
+    return row
+
+
+class TestAdminActions:
+    def test_suspend_action_flips_status_and_writes_audit(self, db):
+        from licenses.models import LicenseKey, ControlEvent
+        user = _staff_user(db)
+        row = _issue_active_key()
+
+        resp = _staff_client(user).post('/admin/licenses/licensekey/', {
+            'action': 'suspend_selected',
+            '_selected_action': [str(row.pk)],
+        })
+        # Admin actions redirect back to the changelist on success.
+        assert resp.status_code in (200, 302)
+
+        row.refresh_from_db()
+        assert row.status == LicenseKey.Status.SUSPENDED
+
+        events = ControlEvent.objects.filter(license_key=row,
+                                             action=ControlEvent.Action.SUSPEND)
+        assert events.count() == 1
+        assert events.first().actor == user
+
+    def test_resume_action(self, db):
+        from licenses.models import LicenseKey, ControlEvent
+        user = _staff_user(db)
+        row = _issue_active_key()
+        row.status = LicenseKey.Status.SUSPENDED
+        row.save()
+
+        _staff_client(user).post('/admin/licenses/licensekey/', {
+            'action': 'resume_selected',
+            '_selected_action': [str(row.pk)],
+        })
+        row.refresh_from_db()
+        assert row.status == LicenseKey.Status.ACTIVE
+        assert ControlEvent.objects.filter(
+            license_key=row, action=ControlEvent.Action.RESUME,
+        ).count() == 1
+
+    def test_extend_expiry_30_days_from_null(self, db):
+        from licenses.models import LicenseKey, ControlEvent
+        from django.utils import timezone
+        from datetime import timedelta
+        user = _staff_user(db)
+        row = _issue_active_key()
+        assert row.expires_at is None
+
+        _staff_client(user).post('/admin/licenses/licensekey/', {
+            'action': 'extend_expiry_30_days',
+            '_selected_action': [str(row.pk)],
+        })
+        row.refresh_from_db()
+        assert row.expires_at is not None
+        # Anchored at "now" since expires_at was NULL.
+        delta = row.expires_at - timezone.now()
+        assert timedelta(days=29) <= delta <= timedelta(days=31)
+
+        event = ControlEvent.objects.get(
+            license_key=row, action=ControlEvent.Action.EXTEND_EXPIRY,
+        )
+        assert event.metadata['days_added'] == 30
+        assert event.metadata['old_expires_at'] is None
+        assert event.metadata['new_expires_at']
+
+    def test_extend_expiry_when_already_future_adds_to_existing(self, db):
+        from licenses.models import LicenseKey
+        from django.utils import timezone
+        from datetime import timedelta
+        user = _staff_user(db)
+        row = _issue_active_key()
+        row.expires_at = timezone.now() + timedelta(days=10)
+        row.save()
+        before = row.expires_at
+
+        _staff_client(user).post('/admin/licenses/licensekey/', {
+            'action': 'extend_expiry_30_days',
+            '_selected_action': [str(row.pk)],
+        })
+        row.refresh_from_db()
+        # Should add to the existing expiry, not anchor at now.
+        assert row.expires_at - before == timedelta(days=30)
+
+    def test_clear_message_action(self, db):
+        from licenses.models import ControlEvent
+        user = _staff_user(db)
+        row = _issue_active_key()
+        row.message = 'Subscription renews soon'
+        row.save()
+
+        _staff_client(user).post('/admin/licenses/licensekey/', {
+            'action': 'clear_message',
+            '_selected_action': [str(row.pk)],
+        })
+        row.refresh_from_db()
+        assert row.message == ''
+        assert ControlEvent.objects.filter(
+            license_key=row, action=ControlEvent.Action.SET_MESSAGE,
+        ).exists()
+
+
+class TestSaveModelAudit:
+    """Edits via the admin change form (not the bulk actions) should
+    also write ControlEvents."""
+
+    def test_status_flip_via_admin_form_writes_event(self, db):
+        from licenses.models import LicenseKey, ControlEvent
+        from django.contrib.auth.models import User
+        from licenses.admin import LicenseKeyAdmin
+        from django.contrib.admin.sites import AdminSite
+
+        user = User.objects.create_user(username='s', password='p', is_staff=True)
+        row = _issue_active_key()
+        before = LicenseKey.objects.get(pk=row.pk)
+
+        # Simulate the admin's save flow: status changed in memory, then
+        # save_model called by Django's admin internals.
+        row.status = LicenseKey.Status.SUSPENDED
+
+        class _FakeRequest:
+            user = None
+        req = _FakeRequest(); req.user = user
+
+        admin = LicenseKeyAdmin(LicenseKey, AdminSite())
+        admin.save_model(req, row, form=None, change=True)
+
+        assert ControlEvent.objects.filter(
+            license_key=row, action=ControlEvent.Action.SUSPEND,
+        ).exists()
+
+
+# ---------------------------------------------------------------------------
+# Management commands
+# ---------------------------------------------------------------------------
+
+
+class TestGenerateVendorKeypair:
+    def test_prints_both_halves(self):
+        from io import StringIO
+        from django.core.management import call_command
+        out = StringIO()
+        call_command('generate_vendor_keypair', stdout=out)
+        text = out.getvalue()
+        # Two 64-char hex strings (32 bytes each) must appear in the output.
+        import re
+        hexes = re.findall(r'\b[0-9a-f]{64}\b', text)
+        assert len(hexes) >= 2
+        priv_hex, pub_hex = hexes[0], hexes[1]
+
+        # The pubkey must match what you'd derive from the priv — proves
+        # the printed pair is internally consistent.
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+            Ed25519PrivateKey,
+        )
+        priv = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(priv_hex))
+        derived_pub_hex = priv.public_key().public_bytes_raw().hex()
+        assert derived_pub_hex == pub_hex
+
+
+class TestGenerateUnlock:
+    def test_signs_with_configured_private_key(self, settings):
+        import base64
+        import json as _json
+        from io import StringIO
+        from django.core.management import call_command
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+            Ed25519PrivateKey,
+        )
+
+        # Generate a real keypair so we can verify the signature ourselves.
+        priv = Ed25519PrivateKey.generate()
+        settings.LICENSE_VENDOR_PRIVATE_KEY = priv.private_bytes(
+            encoding=__import__('cryptography').hazmat.primitives.serialization.Encoding.Raw,
+            format=__import__('cryptography').hazmat.primitives.serialization.PrivateFormat.Raw,
+            encryption_algorithm=__import__('cryptography').hazmat.primitives.serialization.NoEncryption(),
+        ).hex()
+
+        out = StringIO()
+        call_command(
+            'generate_unlock',
+            signed_at='2099-01-01T00:00:00+00:00',
+            stdout=out,
+        )
+        text = out.getvalue()
+        # The base64 blob is the last non-empty line that isn't part of
+        # the helper text — grab anything that decodes to JSON.
+        candidate = None
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                decoded = base64.b64decode(line, validate=False)
+                blob = _json.loads(decoded)
+                if isinstance(blob, dict) and 'signature' in blob:
+                    candidate = blob
+                    break
+            except Exception:
+                continue
+        assert candidate is not None
+        assert candidate['payload'] == 'PERPETUAL_UNLOCK_v1'
+        assert candidate['signed_at'] == '2099-01-01T00:00:00+00:00'
+
+        # Round-trip: verify the signature matches what the alpha_pos
+        # client would expect.
+        sig = bytes.fromhex(candidate['signature'])
+        msg = f"PERPETUAL_UNLOCK_v1|{candidate['signed_at']}".encode('utf-8')
+        priv.public_key().verify(sig, msg)  # raises on failure
+
+    def test_missing_private_key_raises(self, settings):
+        from django.core.management import call_command
+        from django.core.management.base import CommandError
+        settings.LICENSE_VENDOR_PRIVATE_KEY = ''
+        with pytest.raises(CommandError):
+            call_command('generate_unlock')
+
+    def test_invalid_hex_private_key_raises(self, settings):
+        from django.core.management import call_command
+        from django.core.management.base import CommandError
+        settings.LICENSE_VENDOR_PRIVATE_KEY = 'not-hex-zzzz'
+        with pytest.raises(CommandError):
+            call_command('generate_unlock')
