@@ -1,6 +1,6 @@
 from django.contrib import admin
 
-from licenses.models import LicenseKey
+from licenses.models import ControlEvent, HeartbeatEvent, LicenseKey
 
 
 @admin.register(LicenseKey)
@@ -30,3 +30,45 @@ class LicenseKeyAdmin(admin.ModelAdmin):
             'classes': ('collapse',),
         }),
     )
+
+
+@admin.register(HeartbeatEvent)
+class HeartbeatEventAdmin(admin.ModelAdmin):
+    """High-volume table — list view stays narrow on purpose. Use the
+    LicenseKey detail page to find a tenant's recent activity rather
+    than scrolling this list."""
+    list_display = (
+        'received_at', 'license_key', 'client_version',
+        'branch_id', 'fingerprint', 'ip',
+    )
+    list_filter = ('branch_id', 'client_version')
+    search_fields = ('license_key__key_prefix', 'fingerprint', 'ip')
+    readonly_fields = (
+        'license_key', 'ack_id', 'received_at', 'ip',
+        'client_version', 'branch_id', 'fingerprint', 'payload',
+    )
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+
+@admin.register(ControlEvent)
+class ControlEventAdmin(admin.ModelAdmin):
+    """Audit trail. Read-only — control events should never be edited."""
+    list_display = ('created_at', 'action', 'actor', 'license_key', 'tenant')
+    list_filter = ('action', 'actor')
+    search_fields = (
+        'license_key__key_prefix', 'tenant__org_name', 'tenant__email',
+    )
+    readonly_fields = (
+        'actor', 'action', 'license_key', 'tenant', 'metadata', 'created_at',
+    )
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False

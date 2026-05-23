@@ -11,8 +11,14 @@ from django.utils import timezone
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_POST
 
-from licenses.models import LicenseKey
+from licenses.models import HeartbeatEvent, LicenseKey
 from tenants.models import InviteCode, Tenant
+
+
+# Default heartbeat cadence the server suggests to the client. The client
+# may pick its own interval anyway; this is advisory. 300s mirrors the
+# alpha_pos LICENSE_HEARTBEAT_INTERVAL default.
+DEFAULT_NEXT_HEARTBEAT_S = 300
 
 
 logger = logging.getLogger(__name__)
@@ -153,3 +159,100 @@ def register(request):
         ),
         'issued_at': license_key.created_at.isoformat(),
     }, status=201)
+
+
+def _bearer(request):
+    """Pull the bearer token from the Authorization header. Returns the
+    raw token string, or None if missing / malformed."""
+    auth = request.META.get('HTTP_AUTHORIZATION', '')
+    if not auth.lower().startswith('bearer '):
+        return None
+    return auth[7:].strip() or None
+
+
+def _client_ip(request):
+    """Best-effort client IP. We're behind a reverse proxy in production
+    so honor X-Forwarded-For when present (the proxy must scrub spoofed
+    headers; if it doesn't, this is operator-trusted)."""
+    xff = request.META.get('HTTP_X_FORWARDED_FOR', '')
+    if xff:
+        return xff.split(',')[0].strip() or None
+    return request.META.get('REMOTE_ADDR') or None
+
+
+@csrf_exempt
+@require_POST
+def heartbeat(request):
+    """Bearer-authenticated phone-home. The alpha_pos heartbeat daemon
+    POSTs here every ~5 minutes.
+
+    Request: Authorization: Bearer <key>, JSON body with client_version,
+    branch_id, fingerprint, sent_at, metrics.
+
+    Response 200:
+        { "status": "active|suspended|expired",
+          "expires_at": ISO8601 or null,
+          "server_now": ISO8601,
+          "next_heartbeat_in_s": int,
+          "message": str or null,
+          "ack_id": uuid-string }
+
+    401 on bad / missing key. 410 on revoked.
+    """
+    token = _bearer(request)
+    if not token:
+        return JsonResponse(
+            {'success': False, 'message': 'Bearer token required'},
+            status=401,
+        )
+
+    key_row = LicenseKey.lookup_by_cleartext(token)
+    if key_row is None:
+        return JsonResponse(
+            {'success': False, 'message': 'Unknown license key'},
+            status=401,
+        )
+
+    # Body is informational only — the server's decision is based on
+    # key_row.status / expires_at, not on what the client sends. Tolerate
+    # an empty body so clients can heartbeat with no metadata.
+    try:
+        body = json.loads(request.body) if request.body else {}
+    except (ValueError, TypeError):
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+
+    server_now = timezone.now()
+    computed = key_row.computed_status(now=server_now)
+
+    if computed == LicenseKey.Status.REVOKED:
+        # 410 Gone — the key was permanently retired. The client should
+        # surface a "contact vendor for a new key" message; future
+        # heartbeats with the same token will keep getting 410.
+        return JsonResponse(
+            {'success': False, 'message': 'This license key has been revoked',
+             'status': 'REVOKED'},
+            status=410,
+        )
+
+    # Record the event AFTER we know it's not a bogus token but BEFORE
+    # responding. The ack_id round-trips so the client can correlate.
+    event = HeartbeatEvent.objects.create(
+        license_key=key_row,
+        ip=_client_ip(request),
+        client_version=str(body.get('client_version', ''))[:120],
+        branch_id=str(body.get('branch_id', ''))[:120],
+        fingerprint=str(body.get('fingerprint', ''))[:128],
+        payload=body,
+    )
+
+    return JsonResponse({
+        'success': True,
+        'status': computed,
+        'expires_at': key_row.expires_at.isoformat() if key_row.expires_at else None,
+        'server_now': server_now.isoformat(),
+        'next_heartbeat_in_s': DEFAULT_NEXT_HEARTBEAT_S,
+        'message': key_row.message or None,
+        'ack_id': str(event.ack_id),
+    })

@@ -103,5 +103,98 @@ class LicenseKey(models.Model):
                 return candidate
         return None
 
+    def computed_status(self, *, now=None):
+        """Resolve what the next heartbeat should report.
+
+        SUSPENDED / REVOKED always win. ACTIVE + past `expires_at` is
+        reported as EXPIRED (without mutating the row — the operator can
+        renew by setting a new expires_at; nothing has to flip status
+        back to ACTIVE).
+        """
+        if self.status == self.Status.REVOKED:
+            return self.Status.REVOKED
+        if self.status == self.Status.SUSPENDED:
+            return self.Status.SUSPENDED
+        if self.expires_at:
+            from django.utils import timezone
+            current = now or timezone.now()
+            if current >= self.expires_at:
+                return 'EXPIRED'
+        return self.Status.ACTIVE
+
     def __str__(self):
         return f'LicenseKey<{self.key_prefix}… {self.tenant.org_name} {self.status}>'
+
+
+class HeartbeatEvent(models.Model):
+    """One row per /api/v1/heartbeat call. Kept verbose for now;
+    aggressive retention (30 days raw, then daily rollups) is on the
+    roadmap once the table starts growing.
+
+    `ack_id` is echoed back in the response so the client knows which
+    server replied — useful when debugging multi-instance / CDN setups."""
+    import uuid as _uuid
+
+    license_key = models.ForeignKey(
+        LicenseKey, on_delete=models.CASCADE, related_name='heartbeat_events',
+    )
+    ack_id = models.UUIDField(default=_uuid.uuid4, editable=False, db_index=True)
+    received_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    ip = models.GenericIPAddressField(null=True, blank=True)
+    client_version = models.CharField(max_length=120, blank=True, default='')
+    branch_id = models.CharField(max_length=120, blank=True, default='')
+    fingerprint = models.CharField(max_length=128, blank=True, default='', db_index=True)
+
+    # Original request payload kept verbatim for support diagnostics.
+    # Reasonable size — heartbeat bodies are tiny.
+    payload = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        ordering = ['-received_at']
+        indexes = [
+            models.Index(fields=['license_key', '-received_at']),
+        ]
+
+    def __str__(self):
+        return f'HeartbeatEvent<{self.ack_id} {self.license_key.key_prefix}…>'
+
+
+class ControlEvent(models.Model):
+    """Audit trail for admin actions (suspend, resume, extend expiry,
+    set message, generate unlock, etc.). Append-only — the admin must
+    never edit or delete these. Filled out by the admin action commit;
+    this model is here now so its migration goes out with the heartbeat
+    table rather than as a churn-y add later."""
+
+    class Action(models.TextChoices):
+        SUSPEND = 'SUSPEND', 'Suspend'
+        RESUME = 'RESUME', 'Resume'
+        REVOKE = 'REVOKE', 'Revoke'
+        EXTEND_EXPIRY = 'EXTEND_EXPIRY', 'Extend expiry'
+        SET_MESSAGE = 'SET_MESSAGE', 'Set banner message'
+        INVITE_CREATE = 'INVITE_CREATE', 'Invite code created'
+        INVITE_REVOKE = 'INVITE_REVOKE', 'Invite code revoked'
+        UNLOCK_GENERATED = 'UNLOCK_GENERATED', 'Perpetual unlock generated'
+
+    actor = models.ForeignKey(
+        'auth.User', on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='control_events',
+    )
+    action = models.CharField(max_length=32, choices=Action.choices, db_index=True)
+    license_key = models.ForeignKey(
+        LicenseKey, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='control_events',
+    )
+    tenant = models.ForeignKey(
+        'tenants.Tenant', on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='control_events',
+    )
+    metadata = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f'ControlEvent<{self.action} @ {self.created_at:%Y-%m-%d %H:%M}>'

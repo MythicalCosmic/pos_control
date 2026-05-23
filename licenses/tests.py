@@ -160,3 +160,144 @@ class TestKeyLookup:
         from licenses.models import LicenseKey
         assert LicenseKey.lookup_by_cleartext('') is None
         assert LicenseKey.lookup_by_cleartext(None) is None
+
+
+# ---------------------------------------------------------------------------
+# Heartbeat
+# ---------------------------------------------------------------------------
+
+
+def _heartbeat(key, body=None, *, header_override=None):
+    """Helper: send a bearer-authed heartbeat with the given key + body."""
+    headers = {'HTTP_AUTHORIZATION': f'Bearer {key}'}
+    if header_override is not None:
+        headers = header_override
+    return _client().post(
+        '/api/v1/heartbeat',
+        data=json.dumps(body or {}),
+        content_type='application/json',
+        **headers,
+    )
+
+
+class TestHeartbeatAuth:
+    def test_missing_bearer_returns_401(self, db):
+        resp = _client().post(
+            '/api/v1/heartbeat',
+            data=json.dumps({}),
+            content_type='application/json',
+        )
+        assert resp.status_code == 401
+
+    def test_bad_scheme_returns_401(self, db):
+        resp = _heartbeat('whatever', header_override={
+            'HTTP_AUTHORIZATION': 'NotBearer xxx',
+        })
+        assert resp.status_code == 401
+
+    def test_unknown_key_returns_401(self, db):
+        resp = _heartbeat('totally-fake-key-xxxxxxxx')
+        assert resp.status_code == 401
+
+
+class TestHeartbeatStatusComputation:
+    def _issue(self, **kwargs):
+        from licenses.models import LicenseKey
+        from tenants.models import Tenant
+        t = Tenant.objects.create(
+            org_name=kwargs.pop('org', 'Demo'),
+            email=kwargs.pop('email', 'demo@x.local'),
+        )
+        return LicenseKey.issue(t, **kwargs)
+
+    def test_active_returns_active_with_ack(self):
+        from datetime import timedelta
+        from django.utils import timezone
+        row, key = self._issue(
+            expires_at=timezone.now() + timedelta(days=30),
+        )
+        resp = _heartbeat(key, {'client_version': 'alpha_pos@dev'})
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body['status'] == 'ACTIVE'
+        assert body['expires_at']
+        assert body['server_now']
+        assert body['next_heartbeat_in_s'] == 300
+        assert body['ack_id']
+
+        # HeartbeatEvent recorded with the payload kept.
+        from licenses.models import HeartbeatEvent
+        evt = HeartbeatEvent.objects.get(license_key=row)
+        assert evt.client_version == 'alpha_pos@dev'
+        assert str(evt.ack_id) == body['ack_id']
+
+    def test_suspended_returns_suspended(self):
+        from licenses.models import LicenseKey
+        row, key = self._issue()
+        row.status = LicenseKey.Status.SUSPENDED
+        row.save()
+        resp = _heartbeat(key)
+        assert resp.status_code == 200
+        assert resp.json()['status'] == 'SUSPENDED'
+
+    def test_revoked_returns_410(self):
+        from licenses.models import LicenseKey
+        row, key = self._issue()
+        row.status = LicenseKey.Status.REVOKED
+        row.save()
+        resp = _heartbeat(key)
+        assert resp.status_code == 410
+
+    def test_past_expiry_returns_expired_without_mutating_row(self):
+        from datetime import timedelta
+        from django.utils import timezone
+        from licenses.models import LicenseKey
+        row, key = self._issue(
+            expires_at=timezone.now() - timedelta(hours=1),
+        )
+        resp = _heartbeat(key)
+        assert resp.status_code == 200
+        assert resp.json()['status'] == 'EXPIRED'
+
+        # Row should still be ACTIVE — expiry is computed each heartbeat
+        # against server_now. The vendor renews by extending expires_at,
+        # not by flipping status back.
+        row.refresh_from_db()
+        assert row.status == LicenseKey.Status.ACTIVE
+
+    def test_message_passes_through(self):
+        row, key = self._issue()
+        row.message = 'Subscription expires in 3 days'
+        row.save()
+        resp = _heartbeat(key)
+        assert resp.json()['message'] == 'Subscription expires in 3 days'
+
+    def test_empty_message_returns_null(self):
+        row, key = self._issue()
+        resp = _heartbeat(key)
+        assert resp.json()['message'] is None
+
+
+class TestHeartbeatRecording:
+    def test_bad_body_doesnt_crash(self, db):
+        from licenses.models import LicenseKey, HeartbeatEvent
+        from tenants.models import Tenant
+        t = Tenant.objects.create(org_name='X', email='x@x.local')
+        row, key = LicenseKey.issue(t)
+
+        # Empty body should still record the event.
+        resp = _client().post(
+            '/api/v1/heartbeat', data='', content_type='application/json',
+            HTTP_AUTHORIZATION=f'Bearer {key}',
+        )
+        assert resp.status_code == 200
+        assert HeartbeatEvent.objects.filter(license_key=row).count() == 1
+
+    def test_non_dict_body_is_tolerated(self, db):
+        from licenses.models import LicenseKey
+        from tenants.models import Tenant
+        t = Tenant.objects.create(org_name='X', email='x@x.local')
+        row, key = LicenseKey.issue(t)
+        resp = _heartbeat(key, body='this is a string')  # type: ignore[arg-type]
+        # heartbeat() requires a dict; pass a list directly to exercise
+        # the json.loads -> dict guard.
