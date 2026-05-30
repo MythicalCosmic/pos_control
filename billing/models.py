@@ -17,6 +17,63 @@ Two models live here:
 from django.db import models
 
 
+class SubscriptionPlan(models.Model):
+    """A vendor-published pricing tier. The setup wizard lists the active
+    plans (``GET /api/v1/plans``); the customer picks one and the new
+    Tenant's Subscription is bound to that plan with its fields copied in.
+    Plans are the source of truth on the dashboard; per-tenant overrides
+    are still possible by hand-editing the Subscription row but are the
+    exception, not the rule.
+
+    The fields mirror Subscription so plan→subscription is a straight copy
+    and so a vendor can edit a Subscription independently without
+    re-touching the Plan (e.g., a sweetheart deal for one customer)."""
+
+    code = models.SlugField(
+        max_length=32, unique=True,
+        help_text='Short stable identifier (e.g. "basic", "pro").',
+    )
+    name = models.CharField(
+        max_length=120,
+        help_text='Display name shown to the customer in the setup wizard.',
+    )
+    description = models.TextField(
+        blank=True, default='',
+        help_text='One- or two-line pitch shown next to the price.',
+    )
+    price = models.DecimalField(
+        max_digits=14, decimal_places=2,
+        help_text='So\'m charged each period from the prepaid wallet.',
+    )
+    period_days = models.PositiveIntegerField(
+        default=30, help_text='Length of one billing period, in days.',
+    )
+    warn_days = models.PositiveIntegerField(
+        default=3, help_text='Days before cut-off to start warning the POS.',
+    )
+    grace_days = models.PositiveIntegerField(
+        default=3,
+        help_text='Days of soft cushion after paid_through before lockout.',
+    )
+    is_active = models.BooleanField(
+        default=True,
+        help_text='Hide retired plans from the wizard without deleting them.',
+    )
+    sort_order = models.PositiveIntegerField(
+        default=100,
+        help_text='Display order — lower first.',
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['sort_order', 'price']
+
+    def __str__(self):
+        return f'Plan<{self.code} {self.price}/{self.period_days}d>'
+
+
 class Subscription(models.Model):
     """The recurring plan for one tenant. Charged ``price`` every
     ``period_days`` out of the tenant's balance."""
@@ -27,6 +84,17 @@ class Subscription(models.Model):
 
     tenant = models.OneToOneField(
         'tenants.Tenant', on_delete=models.CASCADE, related_name='subscription',
+    )
+
+    # The plan the customer chose at setup (or via a vendor-approved
+    # PlanChangeRequest). Nullable for two reasons: (a) the free
+    # auto-created Subscription at registration when no plan was picked,
+    # (b) legacy rows from before the plan catalog existed.
+    plan = models.ForeignKey(
+        'billing.SubscriptionPlan',
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name='subscriptions',
     )
 
     price = models.DecimalField(
@@ -76,6 +144,65 @@ class Subscription(models.Model):
 
     def __str__(self):
         return f'Subscription<{self.tenant.org_name} {self.price}/{self.period_days}d {self.status}>'
+
+
+class PlanChangeRequest(models.Model):
+    """A customer asked to move to a different plan; the vendor must
+    approve. Approval swaps the Tenant's Subscription.plan and copies the
+    new plan's pricing in. Rejection is a no-op on billing. Either way
+    leaves an audit row.
+
+    One pending request per tenant at a time (DB-level partial unique
+    constraint below) so the admin queue can't fill with duplicates if
+    the customer hammers the button."""
+
+    class Status(models.TextChoices):
+        PENDING = 'PENDING', 'Pending vendor approval'
+        APPROVED = 'APPROVED', 'Approved'
+        REJECTED = 'REJECTED', 'Rejected'
+
+    tenant = models.ForeignKey(
+        'tenants.Tenant', on_delete=models.CASCADE,
+        related_name='plan_change_requests',
+    )
+    current_plan = models.ForeignKey(
+        'billing.SubscriptionPlan', on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='+',
+        help_text='Snapshot of the plan the tenant was on when the request was filed.',
+    )
+    requested_plan = models.ForeignKey(
+        'billing.SubscriptionPlan', on_delete=models.CASCADE,
+        related_name='+',
+    )
+    status = models.CharField(
+        max_length=12, choices=Status.choices, default=Status.PENDING,
+        db_index=True,
+    )
+    note = models.CharField(max_length=255, blank=True, default='')
+
+    requested_at = models.DateTimeField(auto_now_add=True)
+    decided_at = models.DateTimeField(null=True, blank=True)
+    decided_by = models.ForeignKey(
+        'auth.User', on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='plan_change_decisions',
+    )
+    decision_note = models.CharField(max_length=255, blank=True, default='')
+
+    class Meta:
+        ordering = ['-requested_at']
+        constraints = [
+            # Only one PENDING request per tenant at a time. APPROVED /
+            # REJECTED rows accumulate freely for history.
+            models.UniqueConstraint(
+                fields=['tenant'],
+                condition=models.Q(status='PENDING'),
+                name='one_pending_plan_change_per_tenant',
+            ),
+        ]
+
+    def __str__(self):
+        return (f'PlanChangeRequest<{self.tenant.org_name} '
+                f'{self.current_plan_id}→{self.requested_plan_id} {self.status}>')
 
 
 class Payment(models.Model):

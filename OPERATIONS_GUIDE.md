@@ -162,26 +162,58 @@ python manage.py heartbeat_daemon --once
 
 ## 4. Onboard a restaurant
 
-The flow is **"email verified by you, then they pay monthly"** — the
-customer never sees an invite code; the vendor (you) verifies the email by
-pre-issuing an `InviteCode` bound to it.
+The flow is **"email verified by you, customer picks a plan, then they
+pay monthly"** — the customer never sees an invite code; the vendor (you)
+verifies the email by pre-issuing an `InviteCode` bound to it. The
+customer picks one of the plans you published, the wizard binds their new
+Subscription to it, and they top up the wallet to fund it.
 
-1. **Issue an invite** in the control center admin →
-   *Tenants › Invite codes › Add*. Set `intended_email` to the address the
-   restaurant will type in their POS. Optionally set `intended_org_name`
-   (cosmetic — pre-fills the Tenant row's display name) and `expires_at`.
-   Save. You do not need to send the customer the generated `code` — they
-   never type it.
-2. **Customer types only their email** in the alpha_pos setup wizard, which
-   POSTs `{"email": "..."}` to `/api/licensing/setup`. alpha_pos relays
-   `{"email": "..."}` to the control center's `/api/v1/register`.
-3. The control center looks up the **oldest unconsumed, unexpired invite
-   whose `intended_email` matches** (case-insensitive), consumes it,
-   creates the Tenant + Subscription + LicenseKey, and returns the cleartext
-   key to alpha_pos. alpha_pos encrypts it with `LICENSE_FERNET_KEY` and
-   flips to `ACTIVE`. **The cleartext is never echoed back to the operator
-   — there is no recovery if alpha_pos's Fernet key is lost.**
-4. The kill switch clears; business endpoints start responding.
+1. **Publish your plans** in the control center admin →
+   *Billing › Subscription plans › Add* (do this once, not per customer).
+   Each plan needs a `code` (stable id like `basic`), a customer-facing
+   `name` + `description`, the `price` per period, `period_days`,
+   `warn_days`, `grace_days`, `is_active`, and `sort_order` (display
+   order in the wizard). Retire a plan by toggling `is_active` off —
+   existing subscribers are unaffected.
+2. **Issue an invite** → *Tenants › Invite codes › Add*. Set
+   `intended_email` to the address the restaurant will type. Optionally
+   set `intended_org_name` (cosmetic — pre-fills the Tenant row's display
+   name) and `expires_at`. Save. You do not need to send the customer the
+   generated `code` — they never type it.
+3. **Customer runs the setup wizard** on alpha_pos:
+   - Wizard hits `GET /api/licensing/plans` (which proxies to the control
+     center's `GET /api/v1/plans`) to render the plan picker.
+   - Customer types their email, picks a plan, and submits.
+   - alpha_pos `POST /api/licensing/setup` `{"email": "...", "plan_id": <n>}`
+     → relayed to control center `/api/v1/register` with both fields.
+4. **The control center**:
+   - Validates the chosen `plan_id` is active.
+   - Finds the oldest unconsumed, unexpired invite whose `intended_email`
+     matches (case-insensitive), consumes it.
+   - Creates the Tenant + LicenseKey + Subscription **bound to the chosen
+     plan** (price / period / warn / grace copied from the plan row).
+   - Returns the cleartext key to alpha_pos.
+5. alpha_pos encrypts the key with `LICENSE_FERNET_KEY` and flips to
+   `ACTIVE`. **The cleartext is never echoed back to the operator — there
+   is no recovery if alpha_pos's Fernet key is lost.**
+6. The kill switch clears; business endpoints start responding. Customer
+   tops up the wallet via Click.uz / Payme.uz to fund the next period.
+
+**Plan changes (customer-initiated, vendor-approved).** Once active, the
+customer can request a different plan from the settings screen:
+- alpha_pos `POST /api/licensing/plan-change` `{"plan_id": <n>, "note": "..."}`
+  → control center `POST /api/v1/plan-change` (bearer license key).
+- A `PlanChangeRequest` row is queued in *Billing › Plan change requests*
+  with status `PENDING`. The customer's next /heartbeat carries a
+  `pending_plan_change` field so the renderer can show "change pending
+  vendor approval".
+- You approve in the admin: select rows → action **"Approve plan change"**.
+  The tenant's Subscription is swapped onto the new plan immediately, and
+  the new pricing applies from the next charge (the current paid-through
+  period stays paid). Reject the action if you don't want to grant it —
+  no billing change happens.
+- Only one PENDING request per tenant at a time (DB-enforced); repeat
+  POSTs from a hammering customer collapse to the same row.
 
 **Legacy "printed code" path** — `/api/v1/register` still accepts
 `{"email", "org_name", "invite_code"}` so an operator can hand a customer a
@@ -199,10 +231,22 @@ the period, the POS runs; when it can't and the grace cushion is exhausted,
 the heartbeat reports `EXPIRED` and the kill switch fires. There are no
 manual expiry dates to juggle.
 
+### Subscription plans (the catalog)
+
+You publish a small catalog of pricing tiers in
+*/admin/ → Billing → Subscription plans*. The setup wizard's plan picker
+calls `GET /api/v1/plans` to list every plan with `is_active=True`,
+ordered by `sort_order`. A plan carries its own `price`, `period_days`,
+`warn_days`, `grace_days` — those values get **copied** to a tenant's
+Subscription when they pick the plan (so a later edit to the plan doesn't
+retroactively re-bill existing subscribers).
+
 ### Set up a tenant's plan
 
-`/admin/` → *Billing › Subscriptions* (one is auto-created at registration
-with `price=0`, i.e. free until you set a price):
+`/admin/` → *Billing › Subscriptions*. If the customer picked a plan in
+the wizard the Subscription is already bound (read the `plan` field). If
+they went through the legacy path or you skipped the plan, the row is
+auto-created with `price=0` (free until you set one):
 
 | Field | Meaning |
 |---|---|
@@ -316,7 +360,7 @@ curl https://<pos-host>/api/licensing/status              # -> {"status":"UNREGI
 Run the unit suites (each project has its own venv with its own deps):
 
 ```bash
-cd pos_control_center && DEBUG=True .venv/bin/pytest -q   # 73 passed
+cd pos_control_center && DEBUG=True .venv/bin/pytest -q   # 86 passed
 cd alpha_pos          && DEBUG=True .venv/bin/pytest -q   # 264 passed
 ```
 

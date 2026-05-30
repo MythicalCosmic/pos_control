@@ -113,6 +113,39 @@ def _parse_body(request):
         )
 
 
+def _serialize_plan(plan):
+    """Wire shape of a SubscriptionPlan. Same fields whether listed by
+    /api/v1/plans or attached to the heartbeat response — the alpha_pos
+    renderer parses one shape."""
+    return {
+        'id': plan.pk,
+        'code': plan.code,
+        'name': plan.name,
+        'description': plan.description,
+        'price': str(plan.price),
+        'period_days': plan.period_days,
+        'warn_days': plan.warn_days,
+        'grace_days': plan.grace_days,
+        'sort_order': plan.sort_order,
+    }
+
+
+def plans(request):
+    """List active subscription plans. No auth — the setup wizard hits
+    this to show the customer their choices before they have a license
+    key. ``GET`` only; safe to cache aggressively on the alpha_pos side."""
+    if request.method != 'GET':
+        return JsonResponse(
+            {'success': False, 'message': 'GET only'}, status=405,
+        )
+    from billing.models import SubscriptionPlan
+    rows = SubscriptionPlan.objects.filter(is_active=True)
+    return JsonResponse({
+        'success': True,
+        'plans': [_serialize_plan(p) for p in rows],
+    })
+
+
 @csrf_exempt
 @require_POST
 def register(request):
@@ -146,6 +179,7 @@ def register(request):
     email = (data.get('email') or '').strip().lower()
     org_name = (data.get('org_name') or '').strip()
     invite_code = (data.get('invite_code') or '').strip()
+    plan_id = data.get('plan_id')
 
     if not email:
         return JsonResponse(
@@ -153,6 +187,23 @@ def register(request):
              'errors': {'email': 'email is required'}},
             status=422,
         )
+
+    # The plan is optional at register time so a vendor can issue an
+    # invite first and assign a plan later. When the wizard does send
+    # one, validate it exists + is active before we touch the invite.
+    chosen_plan = None
+    if plan_id is not None:
+        from billing.models import SubscriptionPlan
+        try:
+            chosen_plan = SubscriptionPlan.objects.get(
+                pk=int(plan_id), is_active=True,
+            )
+        except (SubscriptionPlan.DoesNotExist, ValueError, TypeError):
+            return JsonResponse(
+                {'success': False,
+                 'message': 'Unknown or inactive subscription plan'},
+                status=422,
+            )
 
     now = timezone.now()
 
@@ -207,11 +258,16 @@ def register(request):
             license_key, cleartext = LicenseKey.issue(tenant)
 
             # Give the tenant a subscription so the dashboard shows it and the
-            # heartbeat has something to settle. Defaults to a free plan
-            # (price=0 → always ACTIVE) until the vendor sets a real price —
-            # so registering never instantly locks a customer out.
+            # heartbeat has something to settle. If the wizard sent a plan,
+            # bind that plan's pricing immediately (so the customer can start
+            # topping up to fund it). Otherwise default to a free plan
+            # (price=0 → always ACTIVE) until the vendor sets a real price.
             from billing.models import Subscription
-            Subscription.objects.get_or_create(tenant=tenant)
+            from billing.admin import _bind_plan_to_subscription
+            sub, created = Subscription.objects.get_or_create(tenant=tenant)
+            if chosen_plan is not None and (created or sub.plan_id is None):
+                _bind_plan_to_subscription(sub, chosen_plan)
+                sub.save()
 
             invite.tenant = tenant
             invite.consumed_at = now
@@ -342,6 +398,28 @@ def heartbeat(request):
         payload=body,
     )
 
+    # Plan + pending plan-change snapshot for the POS UI. Both can be null
+    # (legacy tenants with no plan, or no outstanding request).
+    from billing.models import PlanChangeRequest, Subscription
+    sub = Subscription.objects.select_related('plan').filter(
+        tenant_id=key_row.tenant_id,
+    ).first()
+    plan_payload = (
+        _serialize_plan(sub.plan) if (sub and sub.plan) else None
+    )
+    pending = PlanChangeRequest.objects.select_related('requested_plan').filter(
+        tenant_id=key_row.tenant_id,
+        status=PlanChangeRequest.Status.PENDING,
+    ).first()
+    pending_payload = (
+        {
+            'id': pending.pk,
+            'requested_plan': _serialize_plan(pending.requested_plan),
+            'requested_at': pending.requested_at.isoformat(),
+        }
+        if pending else None
+    )
+
     body = {
         'success': True,
         'status': status,
@@ -358,6 +436,10 @@ def heartbeat(request):
         'days_remaining': billing.days_remaining,
         'warn': billing.warn,
         'in_grace': billing.in_grace,
+        # Plan + pending plan-change. Renderer shows the current plan name
+        # and (if non-null) "Plan change pending vendor approval" badge.
+        'plan': plan_payload,
+        'pending_plan_change': pending_payload,
     }
     # Sign the response body so a MITM that's bypassed TLS still can't forge a
     # "status: ACTIVE" reply. Key is the bearer license key itself — both
@@ -368,3 +450,94 @@ def heartbeat(request):
     response = JsonResponse(body)
     response['X-Response-Signature'] = f'sha256={signature}'
     return response
+
+
+@csrf_exempt
+@require_POST
+def plan_change(request):
+    """Bearer-authed: file a request to move to a different plan.
+
+    POST body: ``{"plan_id": <int>, "note": "<optional reason>"}``.
+    The customer authenticates with the same license key they use for
+    /heartbeat. The request is queued for vendor approval — billing
+    does NOT change here. The vendor approves in the admin and the swap
+    takes effect at the next charge.
+
+    Returns 201 on a fresh request; 200 if there's already a pending
+    request for this tenant (idempotent, returns the existing row);
+    422 on bad plan; 409 if asking for the plan they're already on.
+    """
+    token = _bearer(request)
+    if not token:
+        return JsonResponse(
+            {'success': False, 'message': 'Bearer token required'},
+            status=401,
+        )
+    key_row = LicenseKey.lookup_by_cleartext(token)
+    if key_row is None or key_row.status == LicenseKey.Status.REVOKED:
+        return JsonResponse(
+            {'success': False, 'message': 'Invalid license key'},
+            status=401,
+        )
+
+    data, err = _parse_body(request)
+    if err:
+        return err
+
+    plan_id = data.get('plan_id')
+    note = (data.get('note') or '')[:255]
+
+    from billing.models import PlanChangeRequest, Subscription, SubscriptionPlan
+    try:
+        requested_plan = SubscriptionPlan.objects.get(
+            pk=int(plan_id), is_active=True,
+        )
+    except (SubscriptionPlan.DoesNotExist, ValueError, TypeError):
+        return JsonResponse(
+            {'success': False, 'message': 'Unknown or inactive plan'},
+            status=422,
+        )
+
+    sub = Subscription.objects.select_related('plan').filter(
+        tenant_id=key_row.tenant_id,
+    ).first()
+    if sub and sub.plan_id == requested_plan.pk:
+        return JsonResponse(
+            {'success': False,
+             'message': 'You are already on this plan'},
+            status=409,
+        )
+
+    # One PENDING per tenant — repeat POSTs (network blip, customer
+    # hammering the button) collapse to the same row.
+    with transaction.atomic():
+        existing = (
+            PlanChangeRequest.objects
+            .select_for_update()
+            .filter(tenant_id=key_row.tenant_id,
+                    status=PlanChangeRequest.Status.PENDING)
+            .first()
+        )
+        if existing is not None:
+            return JsonResponse({
+                'success': True,
+                'status': existing.status,
+                'request_id': existing.pk,
+                'requested_plan': _serialize_plan(existing.requested_plan),
+                'message': 'A plan change is already pending vendor approval.',
+            }, status=200)
+
+        req = PlanChangeRequest.objects.create(
+            tenant_id=key_row.tenant_id,
+            current_plan=sub.plan if sub else None,
+            requested_plan=requested_plan,
+            note=note,
+        )
+
+    return JsonResponse({
+        'success': True,
+        'status': req.status,
+        'request_id': req.pk,
+        'requested_plan': _serialize_plan(requested_plan),
+        'message': 'Plan change submitted for vendor approval.',
+    }, status=201)

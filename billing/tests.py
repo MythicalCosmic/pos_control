@@ -356,3 +356,225 @@ class TestBillSubscriptionsCommand:
         out = StringIO()
         call_command('bill_subscriptions', stdout=out)
         assert mail.outbox == []
+
+
+# ---------------------------------------------------------------------------
+# Subscription plans + plan change requests
+# ---------------------------------------------------------------------------
+
+
+def _plan(code='basic', name='Basic', price=Decimal('100'), **kwargs):
+    from billing.models import SubscriptionPlan
+    return SubscriptionPlan.objects.create(
+        code=code, name=name, price=price,
+        period_days=kwargs.pop('period_days', 30),
+        warn_days=kwargs.pop('warn_days', 3),
+        grace_days=kwargs.pop('grace_days', 3),
+        is_active=kwargs.pop('is_active', True),
+        **kwargs,
+    )
+
+
+class TestPlansEndpoint:
+    """GET /api/v1/plans is unauthenticated (the wizard hits it before
+    any license exists). Inactive plans are hidden so a retired tier
+    can't be picked."""
+
+    def test_returns_only_active_plans_in_sort_order(self):
+        from django.test import Client
+        _plan(code='pro', name='Pro', price=Decimal('250'), sort_order=200)
+        _plan(code='basic', name='Basic', price=Decimal('100'), sort_order=100)
+        _plan(code='dead', name='Retired', price=Decimal('999'), is_active=False)
+
+        resp = Client().get('/api/v1/plans')
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body['success'] is True
+        codes = [p['code'] for p in body['plans']]
+        assert codes == ['basic', 'pro']  # sort_order ascending
+        # Wire shape includes everything the wizard renders.
+        assert {'id', 'code', 'name', 'description', 'price',
+                'period_days', 'warn_days', 'grace_days'} <= set(body['plans'][0])
+
+    def test_rejects_non_get(self):
+        from django.test import Client
+        resp = Client().post('/api/v1/plans')
+        assert resp.status_code == 405
+
+
+class TestRegisterWithPlan:
+    """When the wizard sends a plan_id, the new Subscription is bound
+    to that plan with its pricing fields copied in. Empty plan_id falls
+    back to the free auto-created Subscription (price=0)."""
+
+    def _register(self, payload):
+        import json as _j
+        from django.test import Client
+        return Client().post(
+            '/api/v1/register', data=_j.dumps(payload),
+            content_type='application/json',
+        )
+
+    def test_register_with_plan_binds_subscription(self, bound_invite_code):
+        plan = _plan(code='basic', price=Decimal('100'), grace_days=5)
+        resp = self._register({
+            'email': 'plov@example.com', 'plan_id': plan.pk,
+        })
+        assert resp.status_code == 201
+        from billing.models import Subscription
+        sub = Subscription.objects.get(tenant_id=resp.json()['tenant_id'])
+        assert sub.plan_id == plan.pk
+        assert sub.price == Decimal('100.00')
+        assert sub.grace_days == 5
+
+    def test_register_with_unknown_plan_returns_422(self, bound_invite_code):
+        resp = self._register({'email': 'plov@example.com', 'plan_id': 999999})
+        assert resp.status_code == 422
+
+    def test_register_with_inactive_plan_returns_422(self, bound_invite_code):
+        plan = _plan(code='dead', is_active=False)
+        resp = self._register({'email': 'plov@example.com', 'plan_id': plan.pk})
+        assert resp.status_code == 422
+
+    def test_register_without_plan_still_works(self, bound_invite_code):
+        resp = self._register({'email': 'plov@example.com'})
+        assert resp.status_code == 201
+        from billing.models import Subscription
+        sub = Subscription.objects.get(tenant_id=resp.json()['tenant_id'])
+        assert sub.plan_id is None
+        assert sub.price == Decimal('0')
+
+
+class TestPlanChangeEndpoint:
+    """POST /api/v1/plan-change with the bearer key files a request for
+    vendor approval. One PENDING per tenant; idempotent on retry."""
+
+    def _bearer(self):
+        from licenses.models import LicenseKey
+        t = _tenant(email='t@x.local')
+        row, key = LicenseKey.issue(t)
+        return t, row, key
+
+    def _post(self, key, payload):
+        import json as _j
+        from django.test import Client
+        return Client().post(
+            '/api/v1/plan-change',
+            data=_j.dumps(payload),
+            content_type='application/json',
+            HTTP_AUTHORIZATION=f'Bearer {key}',
+        )
+
+    def test_creates_pending_request(self):
+        from billing.models import PlanChangeRequest, Subscription
+        t, _, key = self._bearer()
+        Subscription.objects.create(tenant=t)
+        plan = _plan(code='pro', price=Decimal('250'))
+
+        resp = self._post(key, {'plan_id': plan.pk, 'note': 'want more features'})
+        assert resp.status_code == 201
+        body = resp.json()
+        assert body['status'] == 'PENDING'
+        assert body['requested_plan']['code'] == 'pro'
+
+        req = PlanChangeRequest.objects.get(pk=body['request_id'])
+        assert req.tenant_id == t.pk
+        assert req.requested_plan_id == plan.pk
+        assert req.note == 'want more features'
+
+    def test_idempotent_when_pending_exists(self):
+        from billing.models import PlanChangeRequest, Subscription
+        t, _, key = self._bearer()
+        Subscription.objects.create(tenant=t)
+        plan = _plan(code='pro', price=Decimal('250'))
+
+        first = self._post(key, {'plan_id': plan.pk})
+        assert first.status_code == 201
+        second = self._post(key, {'plan_id': plan.pk})
+        assert second.status_code == 200
+        # Same row returned, not a new one.
+        assert second.json()['request_id'] == first.json()['request_id']
+        assert PlanChangeRequest.objects.filter(tenant=t).count() == 1
+
+    def test_409_when_already_on_plan(self):
+        from billing.models import Subscription
+        t, _, key = self._bearer()
+        plan = _plan(code='basic', price=Decimal('100'))
+        Subscription.objects.create(tenant=t, plan=plan)
+
+        resp = self._post(key, {'plan_id': plan.pk})
+        assert resp.status_code == 409
+
+    def test_unknown_plan_returns_422(self):
+        from billing.models import Subscription
+        t, _, key = self._bearer()
+        Subscription.objects.create(tenant=t)
+        resp = self._post(key, {'plan_id': 9999999})
+        assert resp.status_code == 422
+
+    def test_no_bearer_returns_401(self):
+        from django.test import Client
+        plan = _plan(code='pro')
+        resp = Client().post(
+            '/api/v1/plan-change',
+            data='{"plan_id": ' + str(plan.pk) + '}',
+            content_type='application/json',
+        )
+        assert resp.status_code == 401
+
+
+class TestApprovePlanChangeAdminAction:
+    """Approving a request swaps the Subscription onto the new plan with
+    its fields copied in. Rejecting is a no-op on billing."""
+
+    def _seed(self):
+        from django.contrib.auth.models import User
+        from billing.models import PlanChangeRequest, Subscription
+        user = User.objects.create_user(
+            username='vendor', password='pw', is_staff=True, is_superuser=True,
+        )
+        t = _tenant(email='ten@x.local')
+        old = _plan(code='basic', price=Decimal('100'))
+        new = _plan(code='pro', price=Decimal('250'), grace_days=7)
+        sub = Subscription.objects.create(tenant=t, plan=old, price=Decimal('100'))
+        req = PlanChangeRequest.objects.create(
+            tenant=t, current_plan=old, requested_plan=new,
+        )
+        return user, t, sub, req, new
+
+    def test_approve_swaps_plan_and_copies_pricing(self):
+        from django.test import Client
+        from billing.models import PlanChangeRequest, Subscription
+        user, t, sub, req, new_plan = self._seed()
+
+        c = Client(); c.force_login(user)
+        resp = c.post('/admin/billing/planchangerequest/', {
+            'action': 'approve_selected',
+            '_selected_action': [str(req.pk)],
+        })
+        assert resp.status_code in (200, 302)
+
+        req.refresh_from_db()
+        assert req.status == PlanChangeRequest.Status.APPROVED
+        assert req.decided_by_id == user.pk
+
+        sub.refresh_from_db()
+        assert sub.plan_id == new_plan.pk
+        assert sub.price == Decimal('250.00')
+        assert sub.grace_days == 7
+
+    def test_reject_does_not_change_subscription(self):
+        from django.test import Client
+        from billing.models import PlanChangeRequest, Subscription
+        user, t, sub, req, _new = self._seed()
+
+        c = Client(); c.force_login(user)
+        c.post('/admin/billing/planchangerequest/', {
+            'action': 'reject_selected',
+            '_selected_action': [str(req.pk)],
+        })
+        req.refresh_from_db()
+        sub.refresh_from_db()
+        assert req.status == PlanChangeRequest.Status.REJECTED
+        assert sub.price == Decimal('100.00')  # unchanged
+        assert sub.plan.code == 'basic'
