@@ -22,7 +22,38 @@ def _register(payload):
 
 
 class TestRegisterHappyPath:
-    def test_unbound_invite_creates_tenant_and_returns_key(self, invite_code):
+    def test_email_only_redeems_pre_bound_invite(self, bound_invite_code):
+        """The wizard sends only the email; the control center finds the
+        invite the vendor pre-issued for that address — "email verified by
+        vendor"."""
+        resp = _register({'email': 'plov@example.com'})
+        assert resp.status_code == 201
+        body = resp.json()
+        assert body['success'] is True
+        assert len(body['key']) >= 32
+
+        # Server stored sha256(key) and prefix only.
+        from licenses.models import LicenseKey, _hash_key
+        row = LicenseKey.objects.get(tenant_id=body['tenant_id'])
+        assert row.key_hash == _hash_key(body['key'])
+
+        # Invite consumed and bound to the resulting tenant.
+        bound_invite_code.refresh_from_db()
+        assert bound_invite_code.consumed_at is not None
+        assert bound_invite_code.tenant_id == body['tenant_id']
+
+        # Tenant org_name pulled from the invite's intended_org_name.
+        from tenants.models import Tenant
+        tenant = Tenant.objects.get(pk=body['tenant_id'])
+        assert tenant.org_name == 'Plov Plus'
+
+    def test_email_case_is_folded_on_lookup(self, bound_invite_code):
+        resp = _register({'email': 'PLOV@example.com'})
+        assert resp.status_code == 201
+
+    def test_explicit_invite_code_path_still_works(self, invite_code):
+        """Legacy: vendor mails the customer a printed code — they type it
+        in alongside their email. Unbound invites accept any email."""
         resp = _register({
             'email': 'owner@plov.uz',
             'org_name': 'Plov Plus',
@@ -30,38 +61,18 @@ class TestRegisterHappyPath:
         })
         assert resp.status_code == 201
         body = resp.json()
-        assert body['success'] is True
-        assert len(body['key']) >= 32  # 48 bytes urlsafe is ~64 chars
-        assert body['tenant_id']
-        assert body['expires_at'] is None
-
-        # Server stored sha256(key) and prefix only.
-        from licenses.models import LicenseKey, _hash_key
-        row = LicenseKey.objects.get(tenant_id=body['tenant_id'])
-        assert row.key_hash == _hash_key(body['key'])
-        assert row.key_prefix == body['key'][:8]
-
-        # Invite is now consumed and bound to the tenant.
         invite_code.refresh_from_db()
         assert invite_code.consumed_at is not None
         assert invite_code.tenant_id == body['tenant_id']
 
-    def test_bound_invite_matching_payload_succeeds(self, bound_invite_code):
-        resp = _register({
-            'email': 'plov@example.com',
-            'org_name': 'plov plus',  # different case — should still match
-            'invite_code': bound_invite_code.code,
-        })
-        assert resp.status_code == 201
-
 
 class TestRegisterRejections:
-    def test_missing_fields_returns_422(self):
-        resp = _register({'email': 'x@y.local'})
+    def test_missing_email_returns_422(self):
+        resp = _register({'org_name': 'x'})
         assert resp.status_code == 422
         body = resp.json()
         assert body['success'] is False
-        assert set(body['errors']) == {'org_name', 'invite_code'}
+        assert 'email' in body['errors']
 
     def test_invalid_json_returns_400(self):
         resp = _client().post(
@@ -70,13 +81,20 @@ class TestRegisterRejections:
         )
         assert resp.status_code == 400
 
-    def test_unknown_invite_returns_404(self):
+    def test_no_pre_bound_invite_returns_403(self):
+        """No invite_code, no pre-bound invite for this email → vendor
+        hasn't verified this address. 403."""
+        resp = _register({'email': 'stranger@example.com'})
+        assert resp.status_code == 403
+        assert 'no pending invite' in resp.json()['message'].lower()
+
+    def test_unknown_invite_code_returns_404(self):
         resp = _register({
             'email': 'x@y.local', 'org_name': 'Z', 'invite_code': 'nope',
         })
         assert resp.status_code == 404
 
-    def test_already_consumed_returns_409(self, invite_code):
+    def test_already_consumed_invite_code_returns_409(self, invite_code):
         _register({
             'email': 'a@b.local', 'org_name': 'Café A',
             'invite_code': invite_code.code,
@@ -87,7 +105,7 @@ class TestRegisterRejections:
         })
         assert resp.status_code == 409
 
-    def test_expired_invite_returns_410(self, db):
+    def test_expired_invite_code_returns_410(self, db):
         from datetime import timedelta
         from django.utils import timezone
         from tenants.models import InviteCode
@@ -99,7 +117,7 @@ class TestRegisterRejections:
         })
         assert resp.status_code == 410
 
-    def test_bound_invite_wrong_email_returns_403(self, bound_invite_code):
+    def test_bound_invite_code_wrong_email_returns_403(self, bound_invite_code):
         resp = _register({
             'email': 'other@example.com',
             'org_name': 'Plov Plus',
@@ -117,14 +135,31 @@ class TestRegisterRejections:
         assert resp.status_code == 403
         assert 'organization' in resp.json()['message'].lower()
 
+    def test_expired_pre_bound_invite_falls_through_to_403(self, db):
+        """An expired pre-bound invite is invisible to the email-only
+        lookup — same as if no invite existed at all."""
+        from datetime import timedelta
+        from django.utils import timezone
+        from tenants.models import InviteCode
+        InviteCode.objects.create(
+            intended_email='ghost@example.com',
+            expires_at=timezone.now() - timedelta(days=1),
+        )
+        resp = _register({'email': 'ghost@example.com'})
+        assert resp.status_code == 403
+
 
 class TestRegisterIdempotencyOnRetry:
-    """If the customer's first /register succeeds but the response is
-    lost (network blip), a retry with the SAME invite_code should fail
-    with 409 — not double-burn it. Wraps the invite in select_for_update
-    so concurrent POSTs serialize."""
+    """A retried /register (network blip) must not double-burn the invite."""
 
-    def test_double_register_returns_409_on_second(self, invite_code):
+    def test_double_register_email_only_returns_403_on_second(self, bound_invite_code):
+        first = _register({'email': 'plov@example.com'})
+        assert first.status_code == 201
+        # Invite is now consumed; second call finds none unconsumed → 403.
+        second = _register({'email': 'plov@example.com'})
+        assert second.status_code == 403
+
+    def test_double_register_with_code_returns_409_on_second(self, invite_code):
         first = _register({
             'email': 'a@b.local', 'org_name': 'A',
             'invite_code': invite_code.code,

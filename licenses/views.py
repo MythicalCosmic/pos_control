@@ -29,6 +29,75 @@ MAX_BODY_BYTES = 8 * 1024
 logger = logging.getLogger(__name__)
 
 
+def _locate_invite(*, invite_code, email, now):
+    """Return the InviteCode row a /register call should consume, OR a
+    JsonResponse describing why it can't.
+
+    Two paths:
+    - ``invite_code`` was sent → find that exact code (legacy: customer types
+      the code on a card the vendor mailed them).
+    - ``invite_code`` blank → find an unconsumed, unexpired invite whose
+      ``intended_email`` matches the requester's email. This is the modern
+      "email-only" wizard flow: the vendor verifies the email by pre-issuing
+      an invite bound to it.
+
+    Either way the row is taken under ``select_for_update`` so concurrent
+    /register POSTs can't both claim the same invite.
+    """
+    if invite_code:
+        try:
+            invite = (
+                InviteCode.objects.select_for_update()
+                .get(code=invite_code)
+            )
+        except InviteCode.DoesNotExist:
+            return JsonResponse(
+                {'success': False, 'message': 'Unknown invite code'},
+                status=404,
+            )
+
+        if invite.is_consumed():
+            return JsonResponse(
+                {'success': False,
+                 'message': 'This invite code has already been used'},
+                status=409,
+            )
+        if invite.is_expired(now=now):
+            return JsonResponse(
+                {'success': False,
+                 'message': 'This invite code has expired'},
+                status=410,
+            )
+        if invite.intended_email and invite.intended_email.lower() != email:
+            return JsonResponse(
+                {'success': False,
+                 'message': 'This invite is bound to a different email'},
+                status=403,
+            )
+        return invite
+
+    # Email-only path: vendor pre-issued an invite bound to this address.
+    # Picks the oldest unconsumed, unexpired one so re-issuing after a botched
+    # setup is just "issue a fresh invite, customer retries". No invite ==
+    # vendor hasn't verified this email yet → 403.
+    candidates = (
+        InviteCode.objects.select_for_update()
+        .filter(consumed_at__isnull=True, intended_email__iexact=email)
+        .order_by('created_at')
+    )
+    for invite in candidates:
+        if invite.is_expired(now=now):
+            continue
+        return invite
+
+    return JsonResponse(
+        {'success': False,
+         'message': ('No pending invite for this email. '
+                     'Contact the vendor to be issued one.')},
+        status=403,
+    )
+
+
 def _parse_body(request):
     if len(request.body) > MAX_BODY_BYTES:
         return None, JsonResponse(
@@ -45,10 +114,18 @@ def _parse_body(request):
 @csrf_exempt
 @require_POST
 def register(request):
-    """Exchange an invite code for a fresh license key.
+    """Exchange an emailed invite for a fresh license key.
 
     The customer (running the alpha_pos setup wizard) POSTs:
-        { "email": "...", "org_name": "...", "invite_code": "..." }
+        { "email": "..." }
+    The vendor "verifies the email" by having pre-issued an ``InviteCode``
+    with ``intended_email`` equal to that address. There is no self-serve
+    sign-up: if no matching unconsumed invite exists, registration fails.
+
+    Operators can still hand a customer a raw ``invite_code`` (e.g. for a
+    bring-your-own-email migration); pass it in the body alongside ``email``
+    and the lookup uses the code directly. ``org_name`` is optional and just
+    pre-fills the dashboard display.
 
     On success returns:
         { "success": true,
@@ -58,8 +135,8 @@ def register(request):
           "issued_at": ISO8601 }
 
     The key is returned EXACTLY ONCE — we keep only its sha256. If the
-    customer loses it, staff revokes the row and issues a new code +
-    key. There is no recovery."""
+    customer loses it, staff revokes the row and issues a new code + key.
+    There is no recovery."""
     data, err = _parse_body(request)
     if err:
         return err
@@ -68,17 +145,14 @@ def register(request):
     org_name = (data.get('org_name') or '').strip()
     invite_code = (data.get('invite_code') or '').strip()
 
-    missing = [
-        name for name, value in (
-            ('email', email), ('org_name', org_name), ('invite_code', invite_code),
-        ) if not value
-    ]
-    if missing:
+    if not email:
         return JsonResponse(
             {'success': False, 'message': 'Missing required fields',
-             'errors': {f: f'{f} is required' for f in missing}},
+             'errors': {'email': 'email is required'}},
             status=422,
         )
+
+    now = timezone.now()
 
     # Wrap the entire redemption in a transaction so a crash between
     # consuming the invite and issuing the key can't half-burn the
@@ -86,46 +160,28 @@ def register(request):
     # POSTs from both reading "unconsumed" and both issuing keys.
     try:
         with transaction.atomic():
-            try:
-                invite = (
-                    InviteCode.objects.select_for_update()
-                    .get(code=invite_code)
-                )
-            except InviteCode.DoesNotExist:
-                return JsonResponse(
-                    {'success': False, 'message': 'Unknown invite code'},
-                    status=404,
-                )
+            invite = _locate_invite(
+                invite_code=invite_code, email=email, now=now,
+            )
+            if isinstance(invite, JsonResponse):
+                return invite
 
-            if invite.is_consumed():
-                return JsonResponse(
-                    {'success': False,
-                     'message': 'This invite code has already been used'},
-                    status=409,
-                )
-            if invite.is_expired():
-                return JsonResponse(
-                    {'success': False,
-                     'message': 'This invite code has expired'},
-                    status=410,
-                )
-
-            # If staff pre-bound the invite to a specific email/org, the
-            # wizard's payload must match. Case-insensitive on both
-            # sides to forgive typos like "Cafe" vs "cafe".
-            if invite.intended_email and invite.intended_email.lower() != email:
-                return JsonResponse(
-                    {'success': False,
-                     'message': 'This invite is bound to a different email'},
-                    status=403,
-                )
-            if (invite.intended_org_name
+            if (invite.intended_org_name and org_name
                     and invite.intended_org_name.lower() != org_name.lower()):
                 return JsonResponse(
                     {'success': False,
                      'message': 'This invite is bound to a different organization name'},
                     status=403,
                 )
+
+            # Tenant.org_name is required by schema — fall back to the
+            # invite's pre-bound name, then to the email's local-part, so
+            # an email-only setup wizard never trips the model constraint.
+            tenant_org = (
+                org_name
+                or invite.intended_org_name
+                or email.split('@', 1)[0]
+            )
 
             # Reuse the tenant row if it already exists (e.g. an earlier
             # invite was redeemed; this is a rotation). Otherwise create.
@@ -139,7 +195,7 @@ def register(request):
             except Tenant.DoesNotExist:
                 try:
                     tenant = Tenant.objects.create(
-                        org_name=org_name, email=email,
+                        org_name=tenant_org, email=email,
                     )
                 except IntegrityError:
                     # Race: another /register call created the tenant
@@ -156,7 +212,7 @@ def register(request):
             Subscription.objects.get_or_create(tenant=tenant)
 
             invite.tenant = tenant
-            invite.consumed_at = timezone.now()
+            invite.consumed_at = now
             invite.save(update_fields=['tenant', 'consumed_at'])
 
     except Exception:
