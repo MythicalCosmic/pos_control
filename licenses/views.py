@@ -2,6 +2,8 @@
 
 For this first commit only `register` is wired up. Heartbeat lives in
 the next commit; revoke-check is optional and deferred."""
+import hashlib
+import hmac
 import json
 import logging
 
@@ -340,7 +342,7 @@ def heartbeat(request):
         payload=body,
     )
 
-    return JsonResponse({
+    body = {
         'success': True,
         'status': status,
         # expires_at now carries the subscription's paid-through moment.
@@ -356,4 +358,13 @@ def heartbeat(request):
         'days_remaining': billing.days_remaining,
         'warn': billing.warn,
         'in_grace': billing.in_grace,
-    })
+    }
+    # Sign the response body so a MITM that's bypassed TLS still can't forge a
+    # "status: ACTIVE" reply. Key is the bearer license key itself — both
+    # sides already share it, and rotating the key invalidates old signatures
+    # for free. alpha_pos verifies in licensing/services/heartbeat.py.
+    raw = json.dumps(body, separators=(',', ':'), sort_keys=True).encode('utf-8')
+    signature = hmac.new(token.encode('utf-8'), raw, hashlib.sha256).hexdigest()
+    response = JsonResponse(body)
+    response['X-Response-Signature'] = f'sha256={signature}'
+    return response
