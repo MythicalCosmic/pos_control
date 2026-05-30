@@ -2,8 +2,11 @@
 
 Central control plane for **alpha_pos** installs. Hosted by the vendor;
 each restaurant's POS phones home here to confirm its license is still
-valid. See the implementation plan at
-`alpha_pos/.claude/plans/kind-gliding-kay.md` for the full design.
+valid.
+
+> **New here? Read [`OPERATIONS_GUIDE.md`](OPERATIONS_GUIDE.md)** — it covers
+> both projects end to end: vendor keypair, deployment, onboarding, the
+> suspend/resume controls, and the perpetual-unlock escape hatch.
 
 ## What lives here
 
@@ -14,12 +17,13 @@ valid. See the implementation plan at
   vendor must revoke + reissue.
 - **`/api/v1/register`** — exchanges an invite code for a fresh license
   key (the alpha_pos setup wizard calls this).
-- **`/admin/`** — Django admin is the vendor dashboard for v1. Custom
-  bulk actions (suspend, resume, extend expiry, set banner message,
-  generate perpetual unlock) come in follow-up commits.
-
-Heartbeat endpoint, perpetual-unlock generator, and admin actions are
-listed on the plan but not in this initial scaffold.
+- **`/api/v1/heartbeat`** — bearer-authenticated phone-home; returns the
+  current status, expiry, and any banner message.
+- **`/admin/`** — Django admin is the vendor dashboard. Bulk actions
+  (suspend, resume, extend expiry, clear banner message) and an
+  append-only audit trail (`ControlEvent`) are wired up.
+- **`generate_vendor_keypair`** / **`generate_unlock`** — management
+  commands for the Ed25519 perpetual-unlock escape hatch.
 
 ## Running locally
 
@@ -39,7 +43,7 @@ hand its `code` value to an alpha_pos install for the setup wizard.
 ```bash
 DEBUG=True pytest -q
 ```
-
+~
 ## Why a separate repo / project
 
 alpha_pos ships to every restaurant; this control center is yours

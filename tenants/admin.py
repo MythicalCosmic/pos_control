@@ -5,9 +5,12 @@ from tenants.models import InviteCode, Tenant
 
 @admin.register(Tenant)
 class TenantAdmin(admin.ModelAdmin):
-    list_display = ('org_name', 'email', 'created_at')
+    """Read-only on the wallet: top-ups flow in only through the payment
+    providers (Click.uz, Payme.uz). The control center has no manual
+    "Add credit" form — keep money movement on a single, auditable rail."""
+    list_display = ('org_name', 'email', 'balance', 'created_at')
     search_fields = ('org_name', 'email', 'notes')
-    readonly_fields = ('created_at', 'updated_at')
+    readonly_fields = ('balance', 'created_at', 'updated_at')
     ordering = ('org_name',)
 
 

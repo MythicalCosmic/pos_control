@@ -106,21 +106,20 @@ class LicenseKey(models.Model):
     def computed_status(self, *, now=None):
         """Resolve what the next heartbeat should report.
 
-        SUSPENDED / REVOKED always win. ACTIVE + past `expires_at` is
-        reported as EXPIRED (without mutating the row — the operator can
-        renew by setting a new expires_at; nothing has to flip status
-        back to ACTIVE).
+        Manual REVOKED / SUSPENDED on the key always win. Otherwise the
+        verdict is money-driven: the tenant's subscription is settled (a
+        period is charged from the prepaid balance if one is due and
+        affordable) and the result is ACTIVE if the subscription is paid
+        through, else EXPIRED. The legacy `expires_at` column is no longer
+        consulted — `billing.Subscription.paid_through` is the source of
+        truth.
         """
         if self.status == self.Status.REVOKED:
             return self.Status.REVOKED
         if self.status == self.Status.SUSPENDED:
             return self.Status.SUSPENDED
-        if self.expires_at:
-            from django.utils import timezone
-            current = now or timezone.now()
-            if current >= self.expires_at:
-                return 'EXPIRED'
-        return self.Status.ACTIVE
+        from billing.services.billing import resolve
+        return resolve(self.tenant, now=now).status
 
     def __str__(self):
         return f'LicenseKey<{self.key_prefix}… {self.tenant.org_name} {self.status}>'

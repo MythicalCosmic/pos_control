@@ -1,7 +1,4 @@
-from datetime import timedelta
-
 from django.contrib import admin, messages
-from django.utils import timezone
 
 from licenses.models import ControlEvent, HeartbeatEvent, LicenseKey
 
@@ -37,8 +34,6 @@ class LicenseKeyAdmin(admin.ModelAdmin):
     actions = (
         'suspend_selected',
         'resume_selected',
-        'extend_expiry_30_days',
-        'extend_expiry_365_days',
         'clear_message',
     )
 
@@ -94,45 +89,6 @@ class LicenseKeyAdmin(admin.ModelAdmin):
         self._record_event(request, suspended, ControlEvent.Action.RESUME)
         self.message_user(
             request, f'Resumed {len(suspended)} licenses.', messages.SUCCESS,
-        )
-
-    @admin.action(description='Extend expiry by 30 days')
-    def extend_expiry_30_days(self, request, queryset):
-        self._extend(request, queryset, days=30)
-
-    @admin.action(description='Extend expiry by 365 days')
-    def extend_expiry_365_days(self, request, queryset):
-        self._extend(request, queryset, days=365)
-
-    def _extend(self, request, queryset, *, days):
-        """Bump each row's expires_at — if NULL, anchor at now; else add
-        to the existing expiry. ControlEvent records both old and new."""
-        now = timezone.now()
-        updated = []
-        for row in queryset.select_for_update():
-            old = row.expires_at
-            base = row.expires_at if row.expires_at and row.expires_at > now else now
-            row.expires_at = base + timedelta(days=days)
-            row.save(update_fields=['expires_at'])
-            updated.append((row, old))
-
-        ControlEvent.objects.bulk_create([
-            ControlEvent(
-                actor=request.user if request.user.is_authenticated else None,
-                action=ControlEvent.Action.EXTEND_EXPIRY,
-                license_key=row,
-                tenant=row.tenant,
-                metadata={
-                    'days_added': days,
-                    'old_expires_at': old.isoformat() if old else None,
-                    'new_expires_at': row.expires_at.isoformat(),
-                },
-            )
-            for row, old in updated
-        ])
-        self.message_user(
-            request, f'Extended {len(updated)} licenses by {days} days.',
-            messages.SUCCESS,
         )
 
     @admin.action(description='Clear banner message')

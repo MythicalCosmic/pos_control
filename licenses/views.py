@@ -20,11 +20,20 @@ from tenants.models import InviteCode, Tenant
 # alpha_pos LICENSE_HEARTBEAT_INTERVAL default.
 DEFAULT_NEXT_HEARTBEAT_S = 300
 
+# Hard cap on heartbeat / register body size to keep a misbehaving client
+# from posting a 50 MB JSON blob that the JSON parser would happily try to
+# eat. Real heartbeats are < 1 KB; allow 8 KB of slack for metrics growth.
+MAX_BODY_BYTES = 8 * 1024
+
 
 logger = logging.getLogger(__name__)
 
 
 def _parse_body(request):
+    if len(request.body) > MAX_BODY_BYTES:
+        return None, JsonResponse(
+            {'success': False, 'message': 'Request body too large'}, status=413,
+        )
     try:
         return json.loads(request.body), None
     except (json.JSONDecodeError, ValueError):
@@ -139,6 +148,13 @@ def register(request):
 
             license_key, cleartext = LicenseKey.issue(tenant)
 
+            # Give the tenant a subscription so the dashboard shows it and the
+            # heartbeat has something to settle. Defaults to a free plan
+            # (price=0 → always ACTIVE) until the vendor sets a real price —
+            # so registering never instantly locks a customer out.
+            from billing.models import Subscription
+            Subscription.objects.get_or_create(tenant=tenant)
+
             invite.tenant = tenant
             invite.consumed_at = timezone.now()
             invite.save(update_fields=['tenant', 'consumed_at'])
@@ -215,7 +231,13 @@ def heartbeat(request):
 
     # Body is informational only — the server's decision is based on
     # key_row.status / expires_at, not on what the client sends. Tolerate
-    # an empty body so clients can heartbeat with no metadata.
+    # an empty body so clients can heartbeat with no metadata. Oversized
+    # bodies short-circuit before json.loads so the parser never tries to
+    # eat a multi-megabyte blob.
+    if len(request.body) > MAX_BODY_BYTES:
+        return JsonResponse(
+            {'success': False, 'message': 'Request body too large'}, status=413,
+        )
     try:
         body = json.loads(request.body) if request.body else {}
     except (ValueError, TypeError):
@@ -224,9 +246,8 @@ def heartbeat(request):
         body = {}
 
     server_now = timezone.now()
-    computed = key_row.computed_status(now=server_now)
 
-    if computed == LicenseKey.Status.REVOKED:
+    if key_row.status == LicenseKey.Status.REVOKED:
         # 410 Gone — the key was permanently retired. The client should
         # surface a "contact vendor for a new key" message; future
         # heartbeats with the same token will keep getting 410.
@@ -235,6 +256,22 @@ def heartbeat(request):
              'status': 'REVOKED'},
             status=410,
         )
+
+    # Settle the subscription (charges a period from the prepaid balance if
+    # one is due and affordable) and read the money-driven verdict + the
+    # numbers the POS shows the operator. A manually SUSPENDED tenant is
+    # paused, NOT billed — pass charge=False so we don't debit a customer
+    # we've cut off.
+    from billing.services.billing import resolve
+    suspended = key_row.status == LicenseKey.Status.SUSPENDED
+    billing = resolve(key_row.tenant, now=server_now, charge=not suspended)
+
+    # A manual admin SUSPEND still wins over "paid up" — it's the vendor's
+    # override kill switch independent of balance.
+    if suspended:
+        status = LicenseKey.Status.SUSPENDED
+    else:
+        status = billing.status  # 'ACTIVE' or 'EXPIRED'
 
     # Record the event AFTER we know it's not a bogus token but BEFORE
     # responding. The ack_id round-trips so the client can correlate.
@@ -249,10 +286,18 @@ def heartbeat(request):
 
     return JsonResponse({
         'success': True,
-        'status': computed,
-        'expires_at': key_row.expires_at.isoformat() if key_row.expires_at else None,
+        'status': status,
+        # expires_at now carries the subscription's paid-through moment.
+        'expires_at': billing.paid_through.isoformat() if billing.paid_through else None,
         'server_now': server_now.isoformat(),
         'next_heartbeat_in_s': DEFAULT_NEXT_HEARTBEAT_S,
         'message': key_row.message or None,
         'ack_id': str(event.ack_id),
+        # Prepaid-billing fields the POS uses for the "X days left" banner.
+        # `in_grace` flags the soft-cushion state after a missed renewal — the
+        # status stays ACTIVE but the POS should display "pay now" prominently.
+        'balance': str(billing.balance),
+        'days_remaining': billing.days_remaining,
+        'warn': billing.warn,
+        'in_grace': billing.in_grace,
     })

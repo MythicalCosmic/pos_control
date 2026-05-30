@@ -18,4 +18,6 @@ urlpatterns = [
     path('healthz', healthz),
     path('admin/', admin.site.urls),
     path('api/v1/', include('licenses.urls')),
+    # Payment-provider webhooks (Click.uz / Payme.uz top-ups).
+    path('api/billing/', include('billing.urls')),
 ]

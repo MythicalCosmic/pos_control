@@ -43,10 +43,14 @@ INSTALLED_APPS = [
     'django.contrib.staticfiles',
     'tenants',
     'licenses',
+    'billing',
 ]
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
+    # Serves admin static files in production without a separate web server.
+    # Must sit directly after SecurityMiddleware per WhiteNoise docs.
+    'whitenoise.middleware.WhiteNoiseMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
@@ -76,6 +80,8 @@ WSGI_APPLICATION = 'pos_control_center.wsgi.application'
 
 
 # SQLite locally; Postgres in production via DB_ENGINE=django.db.backends.postgresql.
+# CONN_MAX_AGE keeps the connection warm between requests instead of
+# reconnecting on every heartbeat — drops a noticeable chunk of p95 latency.
 if os.environ.get('DB_ENGINE'):
     DATABASES = {
         'default': {
@@ -85,6 +91,8 @@ if os.environ.get('DB_ENGINE'):
             'PASSWORD': os.environ.get('DB_PASSWORD', ''),
             'HOST': os.environ.get('DB_HOST', 'db'),
             'PORT': os.environ.get('DB_PORT', '5432'),
+            'CONN_MAX_AGE': int(os.environ.get('DB_CONN_MAX_AGE', '60')),
+            'CONN_HEALTH_CHECKS': True,
         }
     }
 else:
@@ -111,6 +119,17 @@ USE_TZ = True
 STATIC_URL = 'static/'
 STATIC_ROOT = BASE_DIR / 'staticfiles'
 
+# WhiteNoise: hashed + gzip/brotli-compressed static files so the admin
+# dashboard loads its CSS/JS straight from gunicorn.
+STORAGES = {
+    'default': {
+        'BACKEND': 'django.core.files.storage.FileSystemStorage',
+    },
+    'staticfiles': {
+        'BACKEND': 'whitenoise.storage.CompressedManifestStaticFilesStorage',
+    },
+}
+
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 # Production hardening — matches the patterns used by alpha_pos.
@@ -124,9 +143,48 @@ if not DEBUG:
     SECURE_CONTENT_TYPE_NOSNIFF = True
     SECURE_REFERRER_POLICY = 'same-origin'
     X_FRAME_OPTIONS = 'DENY'
+    # Only redirect to HTTPS when explicitly opted in, so a reverse-proxy
+    # deployment (the typical one) doesn't end up in a redirect loop.
+    SECURE_SSL_REDIRECT = os.environ.get(
+        'SECURE_SSL_REDIRECT', 'False'
+    ).lower() in ('true', '1', 'yes')
+    # Trust X-Forwarded-Proto from a known-good reverse proxy terminating TLS.
+    # Configure only when actually behind such a proxy.
+    if os.environ.get('TRUST_FORWARDED_PROTO', '').lower() in ('true', '1', 'yes'):
+        SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
 
 SESSION_COOKIE_HTTPONLY = True
 CSRF_COOKIE_HTTPONLY = True
+
+# Admin login posts a CSRF-protected form; Django 4+ checks Origin against
+# this list. Set to the dashboard's public origin(s) when serving over HTTPS
+# behind a proxy, e.g. CSRF_TRUSTED_ORIGINS=https://control.example.com
+CSRF_TRUSTED_ORIGINS = [
+    o.strip() for o in os.environ.get('CSRF_TRUSTED_ORIGINS', '').split(',') if o.strip()
+]
+
+# Logging: console handler so register/heartbeat logger.exception() output
+# lands in `docker logs` (and journald / systemd) rather than being swallowed.
+LOGGING = {
+    'version': 1,
+    'disable_existing_loggers': False,
+    'formatters': {
+        'standard': {
+            'format': '{asctime} {levelname} {name}: {message}',
+            'style': '{',
+        },
+    },
+    'handlers': {
+        'console': {
+            'class': 'logging.StreamHandler',
+            'formatter': 'standard',
+        },
+    },
+    'root': {
+        'handlers': ['console'],
+        'level': os.environ.get('LOG_LEVEL', 'INFO'),
+    },
+}
 
 # Ed25519 private key (hex) used to sign perpetual-unlock files for
 # customers if the vendor ever shuts down. NEVER commit this. In
@@ -139,3 +197,37 @@ LICENSE_VENDOR_PRIVATE_KEY = os.environ.get('LICENSE_VENDOR_PRIVATE_KEY', '')
 # verify unlock signatures. Surfaced here only for the dashboard to
 # display alongside generated unlock files.
 LICENSE_VENDOR_PUBLIC_KEY = os.environ.get('LICENSE_VENDOR_PUBLIC_KEY', '')
+
+# --- Payment providers (top-ups credit the tenant's prepaid balance) ---
+# All credits flow in through the payment provider webhooks — the control
+# center has no manual top-up form. Click.uz merchant credentials:
+CLICK_SERVICE_ID = os.environ.get('CLICK_SERVICE_ID', '')
+CLICK_MERCHANT_ID = os.environ.get('CLICK_MERCHANT_ID', '')
+CLICK_SECRET_KEY = os.environ.get('CLICK_SECRET_KEY', '')
+# Payme.uz (Paycom) merchant key:
+PAYME_MERCHANT_KEY = os.environ.get('PAYME_MERCHANT_KEY', '')
+
+
+# --- Email (warning + lockout notifications) ----------------------------------
+# Sent by `python manage.py bill_subscriptions` (run daily from cron). In
+# development the console backend prints emails to stdout; in production set
+# EMAIL_HOST / EMAIL_HOST_USER / EMAIL_HOST_PASSWORD via env and the SMTP
+# backend takes over automatically.
+EMAIL_HOST = os.environ.get('EMAIL_HOST', '')
+if EMAIL_HOST:
+    EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
+    EMAIL_PORT = int(os.environ.get('EMAIL_PORT', '587'))
+    EMAIL_HOST_USER = os.environ.get('EMAIL_HOST_USER', '')
+    EMAIL_HOST_PASSWORD = os.environ.get('EMAIL_HOST_PASSWORD', '')
+    EMAIL_USE_TLS = os.environ.get('EMAIL_USE_TLS', 'True').lower() in (
+        'true', '1', 'yes',
+    )
+    EMAIL_USE_SSL = os.environ.get('EMAIL_USE_SSL', 'False').lower() in (
+        'true', '1', 'yes',
+    )
+    EMAIL_TIMEOUT = int(os.environ.get('EMAIL_TIMEOUT', '15'))
+else:
+    EMAIL_BACKEND = 'django.core.mail.backends.console.EmailBackend'
+DEFAULT_FROM_EMAIL = os.environ.get(
+    'DEFAULT_FROM_EMAIL', 'POS Control Center <noreply@control.local>',
+)

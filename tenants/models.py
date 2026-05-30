@@ -22,11 +22,21 @@ class Tenant(models.Model):
     email = models.EmailField(unique=True)
     notes = models.TextField(blank=True, default='')
 
-    # Placeholder for v2 Stripe integration. Nullable so we don't force
-    # billing on every tenant up front.
+    # Prepaid wallet. The subscription charges its price from here once per
+    # period (see billing.services). When it can't cover the next period the
+    # heartbeat reports EXPIRED and the POS kill switch fires. Topped up via
+    # the admin "Add credit" action or a payment provider (Click / Payme).
+    # Never write this directly outside billing.services — go through
+    # credit_balance()/settle() so the Payment ledger stays consistent.
+    balance = models.DecimalField(
+        max_digits=14, decimal_places=2, default=0,
+        help_text='Prepaid balance. Charged per subscription period.',
+    )
+
+    # External payment-provider customer reference (Click / Payme / Stripe).
     billing_external_id = models.CharField(
         max_length=64, blank=True, default='',
-        help_text='Stripe customer ID (or similar). Empty in v1.',
+        help_text='Payment provider customer ID (or similar). Optional.',
     )
 
     created_at = models.DateTimeField(auto_now_add=True)

@@ -211,19 +211,26 @@ class TestHeartbeatStatusComputation:
         return LicenseKey.issue(t, **kwargs)
 
     def test_active_returns_active_with_ack(self):
-        from datetime import timedelta
-        from django.utils import timezone
-        row, key = self._issue(
-            expires_at=timezone.now() + timedelta(days=30),
-        )
+        from billing.models import Payment, Subscription
+        from billing.services.billing import credit_balance
+        row, key = self._issue()
+        # A priced plan with a funded wallet → settle charges one period and
+        # the heartbeat reports ACTIVE with a paid-through date + balance.
+        Subscription.objects.create(tenant=row.tenant, price=10, period_days=30)
+        credit_balance(row.tenant, 100, source=Payment.Source.MANUAL)
+
         resp = _heartbeat(key, {'client_version': 'alpha_pos@dev'})
         assert resp.status_code == 200
         body = resp.json()
         assert body['status'] == 'ACTIVE'
-        assert body['expires_at']
+        assert body['expires_at']  # paid_through
         assert body['server_now']
         assert body['next_heartbeat_in_s'] == 300
         assert body['ack_id']
+        # Prepaid-billing fields: 100 topped up minus one 10 charge = 90.
+        assert body['balance'] == '90.00'
+        assert body['days_remaining'] is not None
+        assert body['warn'] is False  # ~30 days left, well outside warn window
 
         # HeartbeatEvent recorded with the payload kept.
         from licenses.models import HeartbeatEvent
@@ -248,20 +255,45 @@ class TestHeartbeatStatusComputation:
         resp = _heartbeat(key)
         assert resp.status_code == 410
 
-    def test_past_expiry_returns_expired_without_mutating_row(self):
+    def test_suspended_tenant_is_not_charged(self):
+        """A manually-suspended tenant is paused, not billed — even when a
+        subscription charge is due."""
         from datetime import timedelta
+        from decimal import Decimal
         from django.utils import timezone
+        from billing.models import Payment, Subscription
+        from billing.services.billing import credit_balance
         from licenses.models import LicenseKey
-        row, key = self._issue(
-            expires_at=timezone.now() - timedelta(hours=1),
+        row, key = self._issue()
+        Subscription.objects.create(tenant=row.tenant, price=10, period_days=30)
+        credit_balance(row.tenant, 100, source=Payment.Source.MANUAL)  # → balance 90
+        # Make a charge due, then suspend the key.
+        Subscription.objects.filter(tenant=row.tenant).update(
+            paid_through=timezone.now() - timedelta(seconds=1),
         )
+        row.status = LicenseKey.Status.SUSPENDED
+        row.save()
+
+        resp = _heartbeat(key)
+        assert resp.json()['status'] == 'SUSPENDED'
+        row.tenant.refresh_from_db()
+        # Still 90 — NOT charged the extra 10 while suspended.
+        assert row.tenant.balance == Decimal('90.00')
+
+    def test_unpaid_balance_returns_expired_without_mutating_row(self):
+        from billing.models import Subscription
+        from licenses.models import LicenseKey
+        row, key = self._issue()
+        # Priced plan, empty wallet → can't fund the period → EXPIRED.
+        Subscription.objects.create(tenant=row.tenant, price=10, period_days=30)
+
         resp = _heartbeat(key)
         assert resp.status_code == 200
         assert resp.json()['status'] == 'EXPIRED'
 
-        # Row should still be ACTIVE — expiry is computed each heartbeat
-        # against server_now. The vendor renews by extending expires_at,
-        # not by flipping status back.
+        # Key row stays ACTIVE — the EXPIRED verdict is money-derived each
+        # heartbeat, not a flag on the key. The vendor revives by topping up,
+        # not by flipping status.
         row.refresh_from_db()
         assert row.status == LicenseKey.Status.ACTIVE
 
@@ -368,49 +400,6 @@ class TestAdminActions:
         assert ControlEvent.objects.filter(
             license_key=row, action=ControlEvent.Action.RESUME,
         ).count() == 1
-
-    def test_extend_expiry_30_days_from_null(self, db):
-        from licenses.models import LicenseKey, ControlEvent
-        from django.utils import timezone
-        from datetime import timedelta
-        user = _staff_user(db)
-        row = _issue_active_key()
-        assert row.expires_at is None
-
-        _staff_client(user).post('/admin/licenses/licensekey/', {
-            'action': 'extend_expiry_30_days',
-            '_selected_action': [str(row.pk)],
-        })
-        row.refresh_from_db()
-        assert row.expires_at is not None
-        # Anchored at "now" since expires_at was NULL.
-        delta = row.expires_at - timezone.now()
-        assert timedelta(days=29) <= delta <= timedelta(days=31)
-
-        event = ControlEvent.objects.get(
-            license_key=row, action=ControlEvent.Action.EXTEND_EXPIRY,
-        )
-        assert event.metadata['days_added'] == 30
-        assert event.metadata['old_expires_at'] is None
-        assert event.metadata['new_expires_at']
-
-    def test_extend_expiry_when_already_future_adds_to_existing(self, db):
-        from licenses.models import LicenseKey
-        from django.utils import timezone
-        from datetime import timedelta
-        user = _staff_user(db)
-        row = _issue_active_key()
-        row.expires_at = timezone.now() + timedelta(days=10)
-        row.save()
-        before = row.expires_at
-
-        _staff_client(user).post('/admin/licenses/licensekey/', {
-            'action': 'extend_expiry_30_days',
-            '_selected_action': [str(row.pk)],
-        })
-        row.refresh_from_db()
-        # Should add to the existing expiry, not anchor at now.
-        assert row.expires_at - before == timedelta(days=30)
 
     def test_clear_message_action(self, db):
         from licenses.models import ControlEvent
