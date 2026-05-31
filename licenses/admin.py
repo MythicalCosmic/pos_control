@@ -1,4 +1,5 @@
 from django.contrib import admin, messages
+from django.utils import timezone
 
 from licenses.models import ControlEvent, HeartbeatEvent, LicenseKey
 
@@ -115,6 +116,11 @@ class LicenseKeyAdmin(admin.ModelAdmin):
         if change and obj.pk:
             prev = LicenseKey.objects.get(pk=obj.pk)
             self._diff_and_record(request, prev, obj)
+        # Stamp revoked_at the moment a key is retired so the audit trail and
+        # the admin's Lifecycle panel show *when* it happened. revoked_at is a
+        # readonly field, so the form never sets it — we must here.
+        if obj.status == LicenseKey.Status.REVOKED and obj.revoked_at is None:
+            obj.revoked_at = timezone.now()
         super().save_model(request, obj, form, change)
 
     def _diff_and_record(self, request, before, after):

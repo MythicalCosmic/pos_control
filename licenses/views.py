@@ -4,6 +4,7 @@ For this first commit only `register` is wired up. Heartbeat lives in
 the next commit; revoke-check is optional and deferred."""
 import hashlib
 import hmac
+import ipaddress
 import json
 import logging
 
@@ -301,14 +302,35 @@ def _bearer(request):
     return auth[7:].strip() or None
 
 
+def _valid_ip(value):
+    """Return ``value`` if it parses as an IPv4/IPv6 address, else None.
+    HeartbeatEvent.ip is a GenericIPAddressField → an ``inet`` column on
+    Postgres, which raises DataError (→ HTTP 500) on a malformed value.
+    Django does NOT validate the field on .create(), so we must do it here:
+    the leftmost X-Forwarded-For token is client-controlled even behind a
+    proxy, so a junk header must never reach the INSERT."""
+    if not value:
+        return None
+    try:
+        ipaddress.ip_address(value)
+    except ValueError:
+        return None
+    return value
+
+
 def _client_ip(request):
     """Best-effort client IP. We're behind a reverse proxy in production
     so honor X-Forwarded-For when present (the proxy must scrub spoofed
-    headers; if it doesn't, this is operator-trusted)."""
+    headers; if it doesn't, this is operator-trusted). Always validated
+    before use so a forged/garbled header can't 500 the heartbeat or
+    poison the audit log."""
     xff = request.META.get('HTTP_X_FORWARDED_FOR', '')
     if xff:
-        return xff.split(',')[0].strip() or None
-    return request.META.get('REMOTE_ADDR') or None
+        candidate = _valid_ip(xff.split(',')[0].strip())
+        if candidate is not None:
+            return candidate
+        # Fall through to REMOTE_ADDR rather than storing garbage.
+    return _valid_ip(request.META.get('REMOTE_ADDR'))
 
 
 @csrf_exempt

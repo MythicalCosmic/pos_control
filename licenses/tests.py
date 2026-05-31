@@ -369,6 +369,42 @@ class TestHeartbeatRecording:
         # heartbeat() requires a dict; pass a list directly to exercise
         # the json.loads -> dict guard.
 
+    def test_garbage_xforwarded_for_does_not_crash(self, db):
+        """A forged/garbled X-Forwarded-For must not reach the inet column
+        (would DataError → 500 on Postgres). The junk is dropped — we fall
+        back to a validated REMOTE_ADDR (or NULL) — and the heartbeat still
+        succeeds with the event recorded."""
+        from licenses.models import LicenseKey, HeartbeatEvent
+        from tenants.models import Tenant
+        t = Tenant.objects.create(org_name='X', email='x@x.local')
+        row, key = LicenseKey.issue(t)
+        resp = _client().post(
+            '/api/v1/heartbeat', data='{}', content_type='application/json',
+            HTTP_AUTHORIZATION=f'Bearer {key}',
+            HTTP_X_FORWARDED_FOR='not-an-ip-address',
+        )
+        assert resp.status_code == 200
+        evt = HeartbeatEvent.objects.get(license_key=row)
+        # The garbage header is never stored; ip is NULL or a valid fallback.
+        assert evt.ip != 'not-an-ip-address'
+        if evt.ip is not None:
+            import ipaddress
+            ipaddress.ip_address(evt.ip)  # raises if somehow invalid
+
+    def test_valid_xforwarded_for_is_recorded(self, db):
+        from licenses.models import LicenseKey, HeartbeatEvent
+        from tenants.models import Tenant
+        t = Tenant.objects.create(org_name='X', email='x@x.local')
+        row, key = LicenseKey.issue(t)
+        resp = _client().post(
+            '/api/v1/heartbeat', data='{}', content_type='application/json',
+            HTTP_AUTHORIZATION=f'Bearer {key}',
+            HTTP_X_FORWARDED_FOR='203.0.113.7, 10.0.0.1',
+        )
+        assert resp.status_code == 200
+        evt = HeartbeatEvent.objects.get(license_key=row)
+        assert evt.ip == '203.0.113.7'
+
 
 # ---------------------------------------------------------------------------
 # Admin bulk actions + ControlEvent audit trail
@@ -482,6 +518,29 @@ class TestSaveModelAudit:
         assert ControlEvent.objects.filter(
             license_key=row, action=ControlEvent.Action.SUSPEND,
         ).exists()
+
+    def test_revoke_via_admin_form_stamps_revoked_at(self, db):
+        from licenses.models import LicenseKey
+        from django.contrib.auth.models import User
+        from licenses.admin import LicenseKeyAdmin
+        from django.contrib.admin.sites import AdminSite
+
+        user = User.objects.create_user(username='s', password='p', is_staff=True)
+        row = _issue_active_key()
+        assert row.revoked_at is None
+
+        row.status = LicenseKey.Status.REVOKED
+
+        class _FakeRequest:
+            user = None
+        req = _FakeRequest(); req.user = user
+
+        admin = LicenseKeyAdmin(LicenseKey, AdminSite())
+        admin.save_model(req, row, form=None, change=True)
+
+        row.refresh_from_db()
+        assert row.status == LicenseKey.Status.REVOKED
+        assert row.revoked_at is not None
 
 
 # ---------------------------------------------------------------------------
