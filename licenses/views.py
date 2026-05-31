@@ -130,6 +130,7 @@ def _serialize_plan(plan):
     }
 
 
+@csrf_exempt  # public-read; CSRF would otherwise hide the 405 behind a 403 HTML page
 def plans(request):
     """List active subscription plans. No auth — the setup wizard hits
     this to show the customer their choices before they have a license
@@ -509,30 +510,54 @@ def plan_change(request):
         )
 
     # One PENDING per tenant — repeat POSTs (network blip, customer
-    # hammering the button) collapse to the same row.
-    with transaction.atomic():
-        existing = (
+    # hammering the button) collapse to the same row. We can't lock a
+    # row that doesn't exist yet, so we race-detect via the partial
+    # unique constraint: two concurrent creates → the loser sees
+    # IntegrityError and returns the winner's row as 200.
+    def _existing_or_none():
+        return (
             PlanChangeRequest.objects
-            .select_for_update()
             .filter(tenant_id=key_row.tenant_id,
                     status=PlanChangeRequest.Status.PENDING)
             .first()
         )
-        if existing is not None:
-            return JsonResponse({
-                'success': True,
-                'status': existing.status,
-                'request_id': existing.pk,
-                'requested_plan': _serialize_plan(existing.requested_plan),
-                'message': 'A plan change is already pending vendor approval.',
-            }, status=200)
 
-        req = PlanChangeRequest.objects.create(
-            tenant_id=key_row.tenant_id,
-            current_plan=sub.plan if sub else None,
-            requested_plan=requested_plan,
-            note=note,
-        )
+    existing = _existing_or_none()
+    if existing is not None:
+        return JsonResponse({
+            'success': True,
+            'status': existing.status,
+            'request_id': existing.pk,
+            'requested_plan': _serialize_plan(existing.requested_plan),
+            'message': 'A plan change is already pending vendor approval.',
+        }, status=200)
+
+    try:
+        with transaction.atomic():
+            req = PlanChangeRequest.objects.create(
+                tenant_id=key_row.tenant_id,
+                current_plan=sub.plan if sub else None,
+                requested_plan=requested_plan,
+                note=note,
+            )
+    except IntegrityError:
+        # Another concurrent POST just won — return their row, not 500.
+        winner = _existing_or_none()
+        if winner is None:
+            # The PENDING they created got APPROVED/REJECTED between our
+            # create and our re-query — exceedingly rare; treat as success
+            # but unusable: the customer can retry.
+            return JsonResponse({
+                'success': False,
+                'message': 'Concurrent change resolved; please retry.',
+            }, status=409)
+        return JsonResponse({
+            'success': True,
+            'status': winner.status,
+            'request_id': winner.pk,
+            'requested_plan': _serialize_plan(winner.requested_plan),
+            'message': 'A plan change is already pending vendor approval.',
+        }, status=200)
 
     return JsonResponse({
         'success': True,
