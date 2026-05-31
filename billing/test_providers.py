@@ -195,3 +195,61 @@ class TestPayme:
         cancelled = _payme_call('CancelTransaction', {'id': 'PT-2', 'reason': 5}).json()
         assert cancelled['result']['state'] == -2
         assert PaymeTransaction.objects.get(payme_id='PT-2').state == -2
+
+    def test_cancel_after_perform_reverses_the_credit(self, settings):
+        """Money moved on Perform → a cancel must claw it back, even down to
+        a negative balance if it was already spent."""
+        settings.PAYME_MERCHANT_KEY = PAYME_KEY
+        t = _tenant()
+        acct = {'amount': 100000, 'account': {'tenant_id': t.pk}}  # 1000.00 so'm
+        _payme_call('CreateTransaction', {'id': 'PT-R', 'time': 1, **acct})
+        _payme_call('PerformTransaction', {'id': 'PT-R'})
+        t.refresh_from_db()
+        assert t.balance == Decimal('1000.00')
+
+        _payme_call('CancelTransaction', {'id': 'PT-R', 'reason': 5})
+        t.refresh_from_db()
+        assert t.balance == Decimal('0.00')  # credit reversed
+        # A reversal ledger row exists alongside the original top-up.
+        assert Payment.objects.filter(
+            source=Payment.Source.PAYME, kind=Payment.Kind.ADJUST,
+        ).count() == 1
+
+    def test_cancel_reversal_can_drive_balance_negative(self, settings):
+        settings.PAYME_MERCHANT_KEY = PAYME_KEY
+        t = _tenant()
+        acct = {'amount': 100000, 'account': {'tenant_id': t.pk}}  # 1000.00 so'm
+        _payme_call('CreateTransaction', {'id': 'PT-N', 'time': 1, **acct})
+        _payme_call('PerformTransaction', {'id': 'PT-N'})
+        # Simulate the credit being spent before the cancel lands.
+        Tenant.objects.filter(pk=t.pk).update(balance=Decimal('200.00'))
+
+        _payme_call('CancelTransaction', {'id': 'PT-N', 'reason': 5})
+        t.refresh_from_db()
+        assert t.balance == Decimal('-800.00')
+
+    def test_cancel_is_idempotent_no_double_debit(self, settings):
+        settings.PAYME_MERCHANT_KEY = PAYME_KEY
+        t = _tenant()
+        acct = {'amount': 100000, 'account': {'tenant_id': t.pk}}
+        _payme_call('CreateTransaction', {'id': 'PT-I', 'time': 1, **acct})
+        _payme_call('PerformTransaction', {'id': 'PT-I'})
+        _payme_call('CancelTransaction', {'id': 'PT-I', 'reason': 5})
+        _payme_call('CancelTransaction', {'id': 'PT-I', 'reason': 5})  # retry
+        t.refresh_from_db()
+        assert t.balance == Decimal('0.00')  # debited exactly once
+        assert Payment.objects.filter(
+            source=Payment.Source.PAYME, kind=Payment.Kind.ADJUST,
+        ).count() == 1
+
+    def test_cancel_before_perform_does_not_debit(self, settings):
+        """No money moved (CREATED, never performed) → cancel must NOT debit."""
+        settings.PAYME_MERCHANT_KEY = PAYME_KEY
+        t = _tenant(balance=500)
+        acct = {'amount': 100000, 'account': {'tenant_id': t.pk}}
+        _payme_call('CreateTransaction', {'id': 'PT-C', 'time': 1, **acct})
+        cancelled = _payme_call('CancelTransaction', {'id': 'PT-C', 'reason': 5}).json()
+        assert cancelled['result']['state'] == -1  # cancelled before perform
+        t.refresh_from_db()
+        assert t.balance == Decimal('500.00')  # untouched
+        assert not Payment.objects.filter(kind=Payment.Kind.ADJUST).exists()

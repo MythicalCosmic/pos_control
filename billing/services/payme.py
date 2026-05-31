@@ -23,7 +23,7 @@ from django.conf import settings
 from django.db import transaction
 
 from billing.models import Payment, PaymeTransaction
-from billing.services.billing import credit_balance
+from billing.services.billing import credit_balance, debit_balance
 from tenants.models import Tenant
 
 
@@ -150,21 +150,39 @@ def _perform(params):
 
 def _cancel(params):
     payme_id = params.get('id')
-    txn = PaymeTransaction.objects.filter(payme_id=payme_id).first()
-    if txn is None:
-        raise PaymeError(ERR_TRANSACTION_NOT_FOUND, 'Transaction not found')
-    if txn.state in (PaymeTransaction.State.CANCELLED,
-                     PaymeTransaction.State.CANCELLED_AFTER_COMPLETE):
-        return {'transaction': str(txn.pk), 'cancel_time': txn.cancel_time, 'state': txn.state}
+    with transaction.atomic():
+        txn = PaymeTransaction.objects.select_for_update().filter(payme_id=payme_id).first()
+        if txn is None:
+            raise PaymeError(ERR_TRANSACTION_NOT_FOUND, 'Transaction not found')
+        if txn.state in (PaymeTransaction.State.CANCELLED,
+                         PaymeTransaction.State.CANCELLED_AFTER_COMPLETE):
+            # Already cancelled — idempotent, and the reversal (if any) already
+            # ran on the first cancel. Don't debit again.
+            return {'transaction': str(txn.pk), 'cancel_time': txn.cancel_time, 'state': txn.state}
 
-    now = _now_ms()
-    if txn.state == PaymeTransaction.State.COMPLETED:
-        txn.state = PaymeTransaction.State.CANCELLED_AFTER_COMPLETE
-    else:
-        txn.state = PaymeTransaction.State.CANCELLED
-    txn.cancel_time = now
-    txn.reason = params.get('reason')
-    txn.save(update_fields=['state', 'cancel_time', 'reason'])
+        now = _now_ms()
+        # COMPLETED means the wallet was credited on Perform → this cancel must
+        # claw that money back. CREATED never credited, so nothing to reverse.
+        was_completed = txn.state == PaymeTransaction.State.COMPLETED
+        if was_completed:
+            txn.state = PaymeTransaction.State.CANCELLED_AFTER_COMPLETE
+        else:
+            txn.state = PaymeTransaction.State.CANCELLED
+        txn.cancel_time = now
+        txn.reason = params.get('reason')
+        txn.save(update_fields=['state', 'cancel_time', 'reason'])
+
+    # Reverse the top-up credit outside the txn-row lock. Idempotent on the
+    # ':reversal' external_id (distinct from the credit's id so it doesn't trip
+    # the credit's unique row), so even a crash-retry can't double-debit. The
+    # state guard above already prevents re-entry; this is belt-and-braces.
+    if was_completed:
+        debit_balance(
+            txn.tenant, txn.amount,
+            source=Payment.Source.PAYME,
+            external_id=f'{txn.payme_id}:reversal',
+            note='Payme.uz cancel-after-perform reversal',
+        )
     return {'transaction': str(txn.pk), 'cancel_time': now, 'state': txn.state}
 
 

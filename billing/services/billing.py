@@ -159,6 +159,57 @@ def credit_balance(tenant: Tenant, amount, *, source, external_id='',
     return payment
 
 
+def debit_balance(tenant: Tenant, amount, *, source, external_id='',
+                  actor=None, note='', kind=None) -> Payment:
+    """Subtract money from ``tenant``'s wallet and record a ledger row.
+
+    Unlike a subscription charge (which refuses to overdraw), this ALLOWS the
+    balance to go negative: a payment-provider reversal of an already-performed
+    transaction must always be honored, even if the credited money was spent on
+    a charge in the meantime. The tenant then has to top up past zero to revive,
+    and the next heartbeat reports EXPIRED until they do.
+
+    Idempotent on ``(source, external_id)`` so a retried cancel webhook can't
+    double-debit. Returns the Payment row (the pre-existing one on a duplicate).
+    """
+    amount = Decimal(str(amount)).quantize(Decimal('0.01'))
+    if amount <= 0:
+        raise ValueError('debit amount must be positive')
+    kind = kind or Payment.Kind.ADJUST
+
+    try:
+        with transaction.atomic():
+            if external_id:
+                existing = Payment.objects.filter(
+                    source=source, external_id=external_id,
+                ).first()
+                if existing is not None:
+                    return existing  # already reversed — idempotent replay
+
+            locked = Tenant.objects.select_for_update().get(pk=tenant.pk)
+            locked.balance = locked.balance - amount  # may go negative, by design
+            locked.save(update_fields=['balance', 'updated_at'])
+
+            payment = Payment.objects.create(
+                tenant=locked,
+                amount=amount,
+                kind=kind,
+                source=source,
+                external_id=external_id,
+                balance_after=locked.balance,
+                actor=actor,
+                note=note,
+            )
+    except IntegrityError:
+        # Lost the race against a concurrent identical reversal; return the
+        # winner's row. Only the (source, external_id) partial constraint can
+        # fire here, and only when external_id is non-empty.
+        if external_id:
+            return Payment.objects.get(source=source, external_id=external_id)
+        raise
+    return payment
+
+
 def resolve(tenant: Tenant, now=None, *, charge=True) -> BillingResult:
     """Optionally settle, then report the billing-derived status and the
     numbers the heartbeat forwards to the POS. Does NOT consider manual
