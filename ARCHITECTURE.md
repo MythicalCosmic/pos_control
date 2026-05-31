@@ -21,9 +21,25 @@ Two Django apps, one paying customer:
   center says stop, displays the operator-facing UI. **The restaurant
   runs one of these per site.**
 
+
+
 The two communicate over HTTPS with HMAC-signed responses. The control
 center is the only writable side; alpha_pos is a strict read-and-enforce
 client.
+
+> **Both projects are backend-only — no UI ships in either repo.**
+>
+> - `pos_control_center` exposes a pure JSON REST API. Its only rendered
+>   surface is the auto-generated Django admin (built into Django itself,
+>   not custom code), which the vendor uses as the operational dashboard.
+> - `alpha_pos` exposes a pure JSON REST API too. The setup wizard,
+>   settings screen, plan picker, balance banner, etc. all live in the
+>   **separate frontend project** (the Electron renderer / POS app)
+>   which consumes these JSON endpoints.
+>
+> Wherever this document says "the wizard does X" or "the settings screen
+> shows Y," that means the separate frontend calls our JSON endpoint and
+> renders the result — there is no HTML in this backend that does it.
 
 ---
 
@@ -173,13 +189,16 @@ Every byte that flows between the two projects:
 
 ### Alpha_pos endpoints (relevant to licensing)
 
-| Method | Path | Auth | Used by | Purpose |
+All JSON. The frontend project (Electron renderer / POS app) is the one
+that calls these.
+
+| Method | Path | Auth | Called by | Purpose |
 |---|---|---|---|---|
-| GET | `/healthz` | none | uptime | "still alive" |
-| GET | `/api/licensing/status` | none | renderer | current license snapshot (always 200, even when blocked) |
-| GET | `/api/licensing/plans` | none (rate-limited) | wizard | proxies control center's plan catalog |
-| POST | `/api/licensing/setup` | none (rate-limited) | wizard | email-only onboarding → relays to `/api/v1/register` |
-| POST | `/api/licensing/plan-change` | none (bearer is internal) | settings screen | relays to `/api/v1/plan-change` |
+| GET | `/healthz` | none | uptime probes | "still alive" |
+| GET | `/api/licensing/status` | none | frontend (any screen) | current license snapshot (always 200, even when blocked) |
+| GET | `/api/licensing/plans` | none (rate-limited) | frontend wizard screen | proxies control center's plan catalog |
+| POST | `/api/licensing/setup` | none (rate-limited) | frontend wizard screen | email-only onboarding → relays to `/api/v1/register` |
+| POST | `/api/licensing/plan-change` | none (bearer is internal) | frontend settings screen | relays to `/api/v1/plan-change` |
 
 Everything else on alpha_pos goes through `LicenseEnforcementMiddleware`
 and returns **503** with a structured body when the kill switch is on.
@@ -332,6 +351,12 @@ cd pos_control_center && .venv/bin/python /tmp/bug_hunt.py         # 32/0
 
 So nobody hunts for them:
 
+- **No customer-facing UI in either backend.** Both projects are JSON
+  REST APIs only. The setup wizard, plan picker, balance banner,
+  settings screen — all of that lives in the separate frontend project
+  (Electron renderer / POS app) which calls these endpoints. The control
+  center's only rendered surface is the Django admin, which is the
+  vendor's internal dashboard, not anything the restaurant sees.
 - **Perpetual-unlock escape hatch** (Ed25519 vendor signature). Removed
   from alpha_pos; the control center's `generate_unlock` /
   `generate_vendor_keypair` commands are orphans until the feature is
