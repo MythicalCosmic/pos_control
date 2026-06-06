@@ -1,17 +1,75 @@
-from django.contrib import admin
+from decimal import Decimal, InvalidOperation
+
+from django import forms
+from django.contrib import admin, messages
+from django.contrib.admin.helpers import ActionForm
 
 from tenants.models import InviteCode, Tenant
 
 
+class TopUpActionForm(ActionForm):
+    """Adds an amount + note field next to the Actions dropdown so an operator
+    can credit a tenant's wallet without a payment provider configured."""
+    amount = forms.DecimalField(
+        required=False, max_digits=14, decimal_places=2,
+        label='Top-up amount', min_value=Decimal('0.01'),
+    )
+    note = forms.CharField(required=False, label='Note (optional)')
+
+
 @admin.register(Tenant)
 class TenantAdmin(admin.ModelAdmin):
-    """Read-only on the wallet: top-ups flow in only through the payment
-    providers (Click.uz, Payme.uz). The control center has no manual
-    "Add credit" form — keep money movement on a single, auditable rail."""
+    """Top-ups normally flow in through the payment providers (Click.uz,
+    Payme.uz). When those aren't configured yet, use the "Top up balance"
+    action: enter an amount in the bar, select the tenant(s), and run it. It
+    goes through ``credit_balance`` so the Payment ledger stays the single
+    auditable rail (records a MANUAL Payment + re-settles the subscription)."""
+    action_form = TopUpActionForm
+    actions = ['top_up_balance']
     list_display = ('org_name', 'email', 'balance', 'created_at')
     search_fields = ('org_name', 'email', 'notes')
     readonly_fields = ('balance', 'created_at', 'updated_at')
     ordering = ('org_name',)
+
+    @admin.action(description='Top up balance (enter amount in the bar above)')
+    def top_up_balance(self, request, queryset):
+        from billing.models import Payment
+        from billing.services.billing import credit_balance
+
+        raw = (request.POST.get('amount') or '').strip()
+        if not raw:
+            self.message_user(
+                request,
+                'Enter an amount in the "Top-up amount" field before running this action.',
+                level=messages.ERROR,
+            )
+            return
+        try:
+            amount = Decimal(raw)
+        except (InvalidOperation, TypeError):
+            self.message_user(request, f'Invalid amount: {raw!r}', level=messages.ERROR)
+            return
+
+        note = (request.POST.get('note') or '').strip() or 'Manual admin top-up'
+        credited = 0
+        for tenant in queryset:
+            try:
+                credit_balance(
+                    tenant, amount,
+                    source=Payment.Source.MANUAL,
+                    actor=request.user if request.user.is_authenticated else None,
+                    note=note,
+                )
+                credited += 1
+            except ValueError as exc:
+                self.message_user(request, f'{tenant}: {exc}', level=messages.ERROR)
+
+        if credited:
+            self.message_user(
+                request,
+                f'Credited {amount} to {credited} tenant(s). Their subscription was re-settled.',
+                level=messages.SUCCESS,
+            )
 
 
 @admin.register(InviteCode)
