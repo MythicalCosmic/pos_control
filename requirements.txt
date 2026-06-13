@@ -10,3 +10,4 @@ whitenoise==6.9.0
 # generates them; alpha_pos verifies them). cryptography already
 # brings ed25519 primitives.
 cryptography==48.0.0
+django-cors-headers==4.9.0

@@ -41,12 +41,16 @@ INSTALLED_APPS = [
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
+    'corsheaders',
     'tenants',
     'licenses',
     'billing',
 ]
 
 MIDDLEWARE = [
+    # CORS first (before any response-generating middleware) so the control-center
+    # API answers cross-origin calls from the dashboard frontend.
+    'corsheaders.middleware.CorsMiddleware',
     'django.middleware.security.SecurityMiddleware',
     # Serves admin static files in production without a separate web server.
     # Must sit directly after SecurityMiddleware per WhiteNoise docs.
@@ -58,6 +62,13 @@ MIDDLEWARE = [
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
 ]
+
+# CORS — fully open for the control-center dashboard frontend. Allow-all is the
+# browser-safe combo for a TOKEN-auth client (credentialed CORS stays off). If the
+# dashboard uses cookie/session auth instead, replace allow-all with an explicit
+# CORS_ALLOWED_ORIGINS list and set CORS_ALLOW_CREDENTIALS = True.
+CORS_ALLOW_ALL_ORIGINS = True
+CORS_ALLOW_CREDENTIALS = False
 
 ROOT_URLCONF = 'pos_control_center.urls'
 

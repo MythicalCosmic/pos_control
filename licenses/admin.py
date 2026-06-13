@@ -32,6 +32,8 @@ class LicenseKeyAdmin(admin.ModelAdmin):
     )
 
     actions = (
+        'suspend_tenant',
+        'resume_tenant',
         'suspend_selected',
         'resume_selected',
         'clear_message',
@@ -75,6 +77,53 @@ class LicenseKeyAdmin(admin.ModelAdmin):
         self._record_event(request, active, ControlEvent.Action.SUSPEND)
         self.message_user(
             request, f'Suspended {len(active)} licenses.', messages.SUCCESS,
+        )
+
+    @admin.action(description='⛔ Suspend ALL keys for the selected tenant(s) — kills EVERY install (cloud + tills)')
+    def suspend_tenant(self, request, queryset):
+        # "One click kills both": expand the selection to every ACTIVE key
+        # belonging to the selected keys' tenants, so the cloud edition AND all
+        # of that tenant's tills 503 on their next heartbeat — not just the one
+        # key that happened to be selected. (Each install holds its own key, so
+        # per-key Suspend would otherwise leave the other installs ACTIVE.)
+        tenant_ids = set(queryset.values_list('tenant_id', flat=True))
+        if not tenant_ids:
+            self.message_user(request, 'No tenants in selection.', messages.INFO)
+            return
+        active = list(LicenseKey.objects.filter(
+            tenant_id__in=tenant_ids, status=LicenseKey.Status.ACTIVE))
+        if not active:
+            self.message_user(request, 'No active licenses for these tenant(s).', messages.INFO)
+            return
+        LicenseKey.objects.filter(pk__in=[r.pk for r in active]).update(
+            status=LicenseKey.Status.SUSPENDED,
+        )
+        self._record_event(request, active, ControlEvent.Action.SUSPEND,
+                           metadata={'scope': 'tenant'})
+        self.message_user(
+            request,
+            f'Suspended {len(active)} key(s) across {len(tenant_ids)} tenant(s). '
+            f'Every install (cloud + tills) for those tenants will 503 on its next heartbeat.',
+            messages.SUCCESS,
+        )
+
+    @admin.action(description='✅ Resume ALL keys for the selected tenant(s)')
+    def resume_tenant(self, request, queryset):
+        tenant_ids = set(queryset.values_list('tenant_id', flat=True))
+        suspended = list(LicenseKey.objects.filter(
+            tenant_id__in=tenant_ids, status=LicenseKey.Status.SUSPENDED))
+        if not suspended:
+            self.message_user(request, 'No suspended licenses for these tenant(s).', messages.INFO)
+            return
+        LicenseKey.objects.filter(pk__in=[r.pk for r in suspended]).update(
+            status=LicenseKey.Status.ACTIVE,
+        )
+        self._record_event(request, suspended, ControlEvent.Action.RESUME,
+                           metadata={'scope': 'tenant'})
+        self.message_user(
+            request,
+            f'Resumed {len(suspended)} key(s) across {len(tenant_ids)} tenant(s).',
+            messages.SUCCESS,
         )
 
     @admin.action(description='Resume selected licenses')

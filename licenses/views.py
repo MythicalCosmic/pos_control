@@ -214,49 +214,62 @@ def register(request):
     # POSTs from both reading "unconsumed" and both issuing keys.
     try:
         with transaction.atomic():
-            invite = _locate_invite(
-                invite_code=invite_code, email=email, now=now,
-            )
-            if isinstance(invite, JsonResponse):
-                return invite
-
-            if (invite.intended_org_name and org_name
-                    and invite.intended_org_name.lower() != org_name.lower()):
-                return JsonResponse(
-                    {'success': False,
-                     'message': 'This invite is bound to a different organization name'},
-                    status=403,
+            # ACCOUNT MODEL: the invite gates ACCOUNT CREATION, not every install.
+            # If a tenant already exists for this email, this register is an
+            # ADDITIONAL install "logging into" the same account (e.g. the cloud
+            # joining the till, or a second till) — no invite needed or consumed.
+            # The first-ever register for an email still requires a valid invite.
+            existing = Tenant.objects.select_for_update().filter(email=email).first()
+            invite = None
+            if existing is None:
+                invite = _locate_invite(
+                    invite_code=invite_code, email=email, now=now,
                 )
+                if isinstance(invite, JsonResponse):
+                    return invite
 
-            # Tenant.org_name is required by schema — fall back to the
-            # invite's pre-bound name, then to the email's local-part, so
-            # an email-only setup wizard never trips the model constraint.
-            tenant_org = (
-                org_name
-                or invite.intended_org_name
-                or email.split('@', 1)[0]
-            )
+                if (invite.intended_org_name and org_name
+                        and invite.intended_org_name.lower() != org_name.lower()):
+                    return JsonResponse(
+                        {'success': False,
+                         'message': 'This invite is bound to a different organization name'},
+                        status=403,
+                    )
 
-            # Reuse the tenant row if it already exists (e.g. an earlier
-            # invite was redeemed; this is a rotation). Otherwise create.
-            try:
-                tenant = Tenant.objects.get(email=email)
-                # Cheap update so the dashboard reflects whatever name
-                # the customer just typed.
-                if org_name and tenant.org_name != org_name:
-                    tenant.org_name = org_name
-                    tenant.save(update_fields=['org_name'])
-            except Tenant.DoesNotExist:
+                # Tenant.org_name is required by schema — fall back to the
+                # invite's pre-bound name, then to the email's local-part, so
+                # an email-only setup wizard never trips the model constraint.
+                tenant_org = (
+                    org_name
+                    or invite.intended_org_name
+                    or email.split('@', 1)[0]
+                )
                 try:
                     tenant = Tenant.objects.create(
                         org_name=tenant_org, email=email,
                     )
                 except IntegrityError:
-                    # Race: another /register call created the tenant
-                    # between our get and our create. Re-fetch.
+                    # Race: another /register created the tenant between our
+                    # filter and our create. Re-fetch and treat as account-join.
                     tenant = Tenant.objects.get(email=email)
+            else:
+                # Account login: reuse the existing tenant.
+                tenant = existing
+                if org_name and tenant.org_name != org_name:
+                    tenant.org_name = org_name
+                    tenant.save(update_fields=['org_name'])
 
             license_key, cleartext = LicenseKey.issue(tenant)
+
+            # Kill-switch integrity: a new install joining an account that the
+            # vendor has SUSPENDED must NOT come up ACTIVE and dodge the kill
+            # switch. If any existing key on this tenant is suspended, the fresh
+            # install inherits SUSPENDED (the operator resumes the tenant to
+            # bring everything back together).
+            if existing is not None and LicenseKey.objects.filter(
+                    tenant=tenant, status=LicenseKey.Status.SUSPENDED).exists():
+                license_key.status = LicenseKey.Status.SUSPENDED
+                license_key.save(update_fields=['status'])
 
             # Give the tenant a subscription so the dashboard shows it and the
             # heartbeat has something to settle. If the wizard sent a plan,
@@ -270,9 +283,10 @@ def register(request):
                 _bind_plan_to_subscription(sub, chosen_plan)
                 sub.save()
 
-            invite.tenant = tenant
-            invite.consumed_at = now
-            invite.save(update_fields=['tenant', 'consumed_at'])
+            if invite is not None:
+                invite.tenant = tenant
+                invite.consumed_at = now
+                invite.save(update_fields=['tenant', 'consumed_at'])
 
     except Exception:
         logger.exception('register failed for email=%s', email)
@@ -421,9 +435,16 @@ def heartbeat(request):
         if pending else None
     )
 
+    # Echo the client's per-request nonce (sent_at) so the SIGNED response is
+    # bound to THIS heartbeat. The client sends sent_at and verifies the signed
+    # body carries it back, which closes the replay/clone window (a captured
+    # ACTIVE 200 can't be re-presented for a different request). Captured before
+    # `body` is reassigned to the response dict on the next line.
+    client_sent_at = body.get('sent_at')
     body = {
         'success': True,
         'status': status,
+        'sent_at': client_sent_at,
         # expires_at now carries the subscription's paid-through moment.
         'expires_at': billing.paid_through.isoformat() if billing.paid_through else None,
         'server_now': server_now.isoformat(),
