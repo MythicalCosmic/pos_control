@@ -109,12 +109,24 @@ EOF
 # --- admin (the vendor dashboard login; idempotent) -----------------------
 DC="cd \"$DIR\" && docker compose -f docker-compose.yaml -f docker-compose.edge.yml exec -T web python manage.py"
 eval "$DC migrate --noinput" || true
-echo ">> create the vendor admin if you haven't:"
-echo "   $DC createsuperuser"
+# Django admin users (idempotent): a superuser for /admin/ (the licenses/tenants
+# admin tables) + a normal user, both with password root1234.
+( cd "$DIR" && docker compose -f docker-compose.yaml -f docker-compose.edge.yml exec -T web python manage.py shell ) <<'PYEOF' || true
+from django.contrib.auth import get_user_model
+U = get_user_model()
+a, _ = U.objects.get_or_create(username='admin', defaults={'email': 'admin@local'})
+a.is_staff = a.is_superuser = a.is_active = True
+a.set_password('root1234'); a.save()
+n, _ = U.objects.get_or_create(username='user', defaults={'email': 'user@local'})
+n.is_active = True
+n.set_password('root1234'); n.save()
+print('Django admin users ready: admin (superuser) + user, password root1234')
+PYEOF
 
 echo ""
 echo "============================================================"
 echo "  POS Control Center is up:  https://${HOST}"
+echo "  Django /admin/ login: admin / root1234 (superuser)  +  user / root1234"
 echo "  Vendor dashboard (until the custom UI ships): https://${HOST}/admin/"
 echo "  Point each alpha_pos install at: LICENSE_CONTROL_CENTER_URL=https://${HOST}"
 echo "============================================================"
