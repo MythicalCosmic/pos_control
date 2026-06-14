@@ -109,6 +109,9 @@ EOF
 # --- admin (the vendor dashboard login; idempotent) -----------------------
 DC="cd \"$DIR\" && docker compose -f docker-compose.yaml -f docker-compose.edge.yml exec -T web python manage.py"
 eval "$DC migrate --noinput" || true
+# Seed the standard subscription plans (idempotent — never clobbers edited prices)
+# so the setup wizard + desktop licensing/plans page (GET /api/v1/plans) aren't empty.
+eval "$DC seed_plans" || true
 # Django admin users (idempotent): a superuser for /admin/ (the licenses/tenants
 # admin tables) + a normal user, both with password root1234.
 ( cd "$DIR" && docker compose -f docker-compose.yaml -f docker-compose.edge.yml exec -T web python manage.py shell ) <<'PYEOF' || true
