@@ -39,6 +39,11 @@ class LicenseKeyAdmin(admin.ModelAdmin):
         'clear_message',
     )
 
+    def has_delete_permission(self, request, obj=None):
+        # A retired key is permanently REVOKED; deleting it would also erase
+        # its heartbeat history and undermine the operational audit trail.
+        return False
+
     def last_heartbeat(self, obj):
         """Most-recent HeartbeatEvent timestamp for the list view —
         cheap signal that the install is alive vs gone dark."""
@@ -219,6 +224,9 @@ class HeartbeatEventAdmin(admin.ModelAdmin):
     def has_change_permission(self, request, obj=None):
         return False
 
+    def has_delete_permission(self, request, obj=None):
+        return False
+
 
 @admin.register(ControlEvent)
 class ControlEventAdmin(admin.ModelAdmin):
@@ -236,4 +244,7 @@ class ControlEventAdmin(admin.ModelAdmin):
         return False
 
     def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
         return False

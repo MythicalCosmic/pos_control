@@ -6,10 +6,13 @@ its sha256 hash plus the first 8 chars of the cleartext for support
 lookup. If the customer loses their key, they get a new one — there is
 no recovery of the old.
 """
+
 import hashlib
 import secrets
 
+from django.core.exceptions import ValidationError
 from django.db import models
+from django.utils import timezone
 
 
 KEY_LENGTH_BYTES = 48  # → 64 chars urlsafe base64
@@ -22,7 +25,7 @@ def _new_key_cleartext() -> str:
 
 
 def _hash_key(cleartext: str) -> str:
-    return hashlib.sha256(cleartext.encode('utf-8')).hexdigest()
+    return hashlib.sha256(cleartext.encode("utf-8")).hexdigest()
 
 
 class LicenseKey(models.Model):
@@ -31,12 +34,14 @@ class LicenseKey(models.Model):
     enforced softly by the admin actions, not by a DB constraint."""
 
     class Status(models.TextChoices):
-        ACTIVE = 'ACTIVE', 'Active'
-        SUSPENDED = 'SUSPENDED', 'Suspended'
-        REVOKED = 'REVOKED', 'Revoked'
+        ACTIVE = "ACTIVE", "Active"
+        SUSPENDED = "SUSPENDED", "Suspended"
+        REVOKED = "REVOKED", "Revoked"
 
     tenant = models.ForeignKey(
-        'tenants.Tenant', on_delete=models.CASCADE, related_name='license_keys',
+        "tenants.Tenant",
+        on_delete=models.CASCADE,
+        related_name="license_keys",
     )
 
     # sha256 of the cleartext key — the only persistent form. Indexed
@@ -50,31 +55,34 @@ class LicenseKey(models.Model):
     key_prefix = models.CharField(max_length=8, db_index=True)
 
     status = models.CharField(
-        max_length=12, choices=Status.choices, default=Status.ACTIVE,
+        max_length=12,
+        choices=Status.choices,
+        default=Status.ACTIVE,
         db_index=True,
     )
 
     expires_at = models.DateTimeField(
-        null=True, blank=True,
-        help_text='Subscription end date. NULL = no expiry (perpetual).',
+        null=True,
+        blank=True,
+        help_text="Subscription end date. NULL = no expiry (perpetual).",
     )
 
     # Banner text the POS will display next heartbeat. Use for short
     # advisories like "subscription expires in 3 days" or "scheduled
     # maintenance Friday". Kept short on purpose — anything long belongs
     # in email.
-    message = models.CharField(max_length=500, blank=True, default='')
+    message = models.CharField(max_length=500, blank=True, default="")
 
-    notes = models.TextField(blank=True, default='')
+    notes = models.TextField(blank=True, default="")
 
     created_at = models.DateTimeField(auto_now_add=True)
     revoked_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
-        ordering = ['-created_at']
+        ordering = ["-created_at"]
 
     @classmethod
-    def issue(cls, tenant, *, expires_at=None, notes=''):
+    def issue(cls, tenant, *, expires_at=None, notes=""):
         """Create a fresh key for `tenant`. Returns (LicenseKey, cleartext).
         The cleartext is the only chance to expose it; persist nothing
         else."""
@@ -94,6 +102,7 @@ class LicenseKey(models.Model):
         full hash to defend against partial-match timing leaks. SHA index
         narrows the scan to one row; the compare is just hygiene."""
         from django.utils.crypto import constant_time_compare
+
         if not cleartext or len(cleartext) < 8:
             return None
         target = _hash_key(cleartext)
@@ -102,6 +111,42 @@ class LicenseKey(models.Model):
             if constant_time_compare(candidate.key_hash, target):
                 return candidate
         return None
+
+    def clean(self):
+        super().clean()
+        if self.pk and self.status != self.Status.REVOKED:
+            was_revoked = (
+                type(self)
+                .objects.filter(
+                    pk=self.pk,
+                    status=self.Status.REVOKED,
+                )
+                .exists()
+            )
+            if was_revoked:
+                raise ValidationError(
+                    {
+                        "status": "A revoked license cannot be reactivated.",
+                    }
+                )
+
+    def save(self, *args, **kwargs):
+        if self.pk and self.status != self.Status.REVOKED:
+            was_revoked = (
+                type(self)
+                .objects.filter(
+                    pk=self.pk,
+                    status=self.Status.REVOKED,
+                )
+                .exists()
+            )
+            if was_revoked:
+                raise ValidationError("A revoked license cannot be reactivated.")
+        if self.status == self.Status.REVOKED and self.revoked_at is None:
+            self.revoked_at = timezone.now()
+            if kwargs.get("update_fields") is not None:
+                kwargs["update_fields"] = set(kwargs["update_fields"]) | {"revoked_at"}
+        return super().save(*args, **kwargs)
 
     def computed_status(self, *, now=None):
         """Resolve what the next heartbeat should report.
@@ -119,10 +164,11 @@ class LicenseKey(models.Model):
         if self.status == self.Status.SUSPENDED:
             return self.Status.SUSPENDED
         from billing.services.billing import resolve
+
         return resolve(self.tenant, now=now).status
 
     def __str__(self):
-        return f'LicenseKey<{self.key_prefix}… {self.tenant.org_name} {self.status}>'
+        return f"LicenseKey<{self.key_prefix}… {self.tenant.org_name} {self.status}>"
 
 
 class HeartbeatEvent(models.Model):
@@ -132,31 +178,36 @@ class HeartbeatEvent(models.Model):
 
     `ack_id` is echoed back in the response so the client knows which
     server replied — useful when debugging multi-instance / CDN setups."""
+
     import uuid as _uuid
 
     license_key = models.ForeignKey(
-        LicenseKey, on_delete=models.CASCADE, related_name='heartbeat_events',
+        LicenseKey,
+        on_delete=models.CASCADE,
+        related_name="heartbeat_events",
     )
     ack_id = models.UUIDField(default=_uuid.uuid4, editable=False, db_index=True)
     received_at = models.DateTimeField(auto_now_add=True, db_index=True)
 
     ip = models.GenericIPAddressField(null=True, blank=True)
-    client_version = models.CharField(max_length=120, blank=True, default='')
-    branch_id = models.CharField(max_length=120, blank=True, default='')
-    fingerprint = models.CharField(max_length=128, blank=True, default='', db_index=True)
+    client_version = models.CharField(max_length=120, blank=True, default="")
+    branch_id = models.CharField(max_length=120, blank=True, default="")
+    fingerprint = models.CharField(
+        max_length=128, blank=True, default="", db_index=True
+    )
 
     # Original request payload kept verbatim for support diagnostics.
     # Reasonable size — heartbeat bodies are tiny.
     payload = models.JSONField(default=dict, blank=True)
 
     class Meta:
-        ordering = ['-received_at']
+        ordering = ["-received_at"]
         indexes = [
-            models.Index(fields=['license_key', '-received_at']),
+            models.Index(fields=["license_key", "-received_at"]),
         ]
 
     def __str__(self):
-        return f'HeartbeatEvent<{self.ack_id} {self.license_key.key_prefix}…>'
+        return f"HeartbeatEvent<{self.ack_id} {self.license_key.key_prefix}…>"
 
 
 class ControlEvent(models.Model):
@@ -167,33 +218,44 @@ class ControlEvent(models.Model):
     table rather than as a churn-y add later."""
 
     class Action(models.TextChoices):
-        SUSPEND = 'SUSPEND', 'Suspend'
-        RESUME = 'RESUME', 'Resume'
-        REVOKE = 'REVOKE', 'Revoke'
-        EXTEND_EXPIRY = 'EXTEND_EXPIRY', 'Extend expiry'
-        SET_MESSAGE = 'SET_MESSAGE', 'Set banner message'
-        INVITE_CREATE = 'INVITE_CREATE', 'Invite code created'
-        INVITE_REVOKE = 'INVITE_REVOKE', 'Invite code revoked'
-        UNLOCK_GENERATED = 'UNLOCK_GENERATED', 'Perpetual unlock generated'
+        SUSPEND = "SUSPEND", "Suspend"
+        RESUME = "RESUME", "Resume"
+        REVOKE = "REVOKE", "Revoke"
+        EXTEND_EXPIRY = "EXTEND_EXPIRY", "Extend expiry"
+        SET_MESSAGE = "SET_MESSAGE", "Set banner message"
+        INVITE_CREATE = "INVITE_CREATE", "Invite code created"
+        INVITE_REVOKE = "INVITE_REVOKE", "Invite code revoked"
+        PLAN_CHANGE_APPROVE = "PLAN_CHANGE_APPROVE", "Plan change approved"
+        PLAN_CHANGE_REJECT = "PLAN_CHANGE_REJECT", "Plan change rejected"
+        UNLOCK_GENERATED = "UNLOCK_GENERATED", "Perpetual unlock generated"
 
     actor = models.ForeignKey(
-        'auth.User', on_delete=models.SET_NULL, null=True, blank=True,
-        related_name='control_events',
+        "auth.User",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="control_events",
     )
     action = models.CharField(max_length=32, choices=Action.choices, db_index=True)
     license_key = models.ForeignKey(
-        LicenseKey, on_delete=models.SET_NULL, null=True, blank=True,
-        related_name='control_events',
+        LicenseKey,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="control_events",
     )
     tenant = models.ForeignKey(
-        'tenants.Tenant', on_delete=models.SET_NULL, null=True, blank=True,
-        related_name='control_events',
+        "tenants.Tenant",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="control_events",
     )
     metadata = models.JSONField(default=dict, blank=True)
     created_at = models.DateTimeField(auto_now_add=True, db_index=True)
 
     class Meta:
-        ordering = ['-created_at']
+        ordering = ["-created_at"]
 
     def __str__(self):
-        return f'ControlEvent<{self.action} @ {self.created_at:%Y-%m-%d %H:%M}>'
+        return f"ControlEvent<{self.action} @ {self.created_at:%Y-%m-%d %H:%M}>"

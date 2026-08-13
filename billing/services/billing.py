@@ -41,10 +41,20 @@ from tenants.models import Tenant
 logger = logging.getLogger(__name__)
 
 
-# Cap a single top-up so a misconfigured webhook or admin slip-up can't
+# Cap a single top-up so a misconfigured webhook can't
 # credit an unrecoverably absurd amount in one shot. 1B so'm (~$80k) is two
 # orders of magnitude above any realistic single restaurant top-up.
 MAX_CREDIT_AMOUNT = Decimal('1000000000.00')
+
+
+def bind_plan_to_subscription(subscription: Subscription, plan) -> None:
+    """Copy catalog policy to a tenant subscription without billing it."""
+    subscription.plan = plan
+    subscription.price = plan.price
+    subscription.period_days = plan.period_days
+    subscription.warn_days = plan.warn_days
+    subscription.grace_days = plan.grace_days
+    subscription.status = Subscription.Status.ACTIVE
 
 
 @dataclass
@@ -186,7 +196,11 @@ def resolve(tenant: Tenant, now=None, *, charge=True) -> BillingResult:
     sub.refresh_from_db()
 
     in_grace = False
-    if sub.price <= 0:
+    if sub.status == Subscription.Status.CANCELED:
+        # Cancellation stops renewal but honors a period already paid for.
+        # It must not leave a free/no-period subscription active forever.
+        active = sub.paid_through is not None and sub.paid_through > now
+    elif sub.price <= 0:
         active = True  # free plan
     else:
         if sub.paid_through is None:
@@ -208,7 +222,7 @@ def resolve(tenant: Tenant, now=None, *, charge=True) -> BillingResult:
     if sub.paid_through is not None:
         seconds_left = (sub.paid_through - now).total_seconds()
         days_remaining = max(0, int(seconds_left // 86400))
-        if active and sub.price > 0:
+        if active and sub.price > 0 and sub.status == Subscription.Status.ACTIVE:
             # Warn during the lead window OR during the grace cushion — both
             # are "pay now or get locked out" states for the operator.
             warn = in_grace or days_remaining <= sub.warn_days

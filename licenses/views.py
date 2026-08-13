@@ -4,9 +4,11 @@ For this first commit only `register` is wired up. Heartbeat lives in
 the next commit; revoke-check is optional and deferred."""
 import hashlib
 import hmac
+import ipaddress
 import json
 import logging
 
+from django.conf import settings
 from django.db import IntegrityError, transaction
 from django.http import JsonResponse
 from django.utils import timezone
@@ -64,6 +66,11 @@ def _locate_invite(*, invite_code, email, now):
                  'message': 'This invite code has already been used'},
                 status=409,
             )
+        if invite.is_revoked():
+            return JsonResponse(
+                {'success': False, 'message': 'This invite code has been revoked'},
+                status=410,
+            )
         if invite.is_expired(now=now):
             return JsonResponse(
                 {'success': False,
@@ -84,7 +91,10 @@ def _locate_invite(*, invite_code, email, now):
     # vendor hasn't verified this email yet → 403.
     candidates = (
         InviteCode.objects.select_for_update()
-        .filter(consumed_at__isnull=True, intended_email__iexact=email)
+        .filter(
+            consumed_at__isnull=True, revoked_at__isnull=True,
+            intended_email__iexact=email,
+        )
         .order_by('created_at')
     )
     for invite in candidates:
@@ -277,10 +287,10 @@ def register(request):
             # topping up to fund it). Otherwise default to a free plan
             # (price=0 → always ACTIVE) until the vendor sets a real price.
             from billing.models import Subscription
-            from billing.admin import _bind_plan_to_subscription
+            from billing.services.billing import bind_plan_to_subscription
             sub, created = Subscription.objects.get_or_create(tenant=tenant)
             if chosen_plan is not None and (created or sub.plan_id is None):
-                _bind_plan_to_subscription(sub, chosen_plan)
+                bind_plan_to_subscription(sub, chosen_plan)
                 sub.save()
 
             if invite is not None:
@@ -316,13 +326,18 @@ def _bearer(request):
 
 
 def _client_ip(request):
-    """Best-effort client IP. We're behind a reverse proxy in production
-    so honor X-Forwarded-For when present (the proxy must scrub spoofed
-    headers; if it doesn't, this is operator-trusted)."""
-    xff = request.META.get('HTTP_X_FORWARDED_FOR', '')
-    if xff:
-        return xff.split(',')[0].strip() or None
-    return request.META.get('REMOTE_ADDR') or None
+    """Return a validated client IP, trusting forwarding only when enabled."""
+    candidate = None
+    if settings.TRUST_FORWARDED_FOR:
+        forwarded = request.META.get('HTTP_X_FORWARDED_FOR', '')
+        if forwarded:
+            # The trusted edge appends/replaces the right-most address.
+            candidate = forwarded.rsplit(',', 1)[-1].strip()
+    candidate = candidate or request.META.get('REMOTE_ADDR')
+    try:
+        return str(ipaddress.ip_address(candidate)) if candidate else None
+    except ValueError:
+        return None
 
 
 @csrf_exempt

@@ -1,0 +1,40 @@
+from django.urls import path
+
+from vendor_api import auth_views, views
+
+
+urlpatterns = [
+    path("auth/login", auth_views.login),
+    path("auth/refresh", auth_views.refresh),
+    path("auth/me", auth_views.me),
+    path("auth/logout", auth_views.logout),
+    path("overview", views.overview),
+    path("tenants", views.tenants),
+    path("tenants/<int:tenant_id>", views.tenant_detail),
+    path("tenants/<int:tenant_id>/suspend", views.tenant_suspend),
+    path("tenants/<int:tenant_id>/resume", views.tenant_resume),
+    path("licenses", views.licenses),
+    path("licenses/bulk-action", views.license_bulk_action),
+    path("licenses/<int:license_id>", views.license_detail),
+    path("licenses/<int:license_id>/suspend", views.license_suspend),
+    path("licenses/<int:license_id>/resume", views.license_resume),
+    path("licenses/<int:license_id>/revoke", views.license_revoke),
+    path("licenses/<int:license_id>/message", views.license_message),
+    path("invites", views.invites),
+    path("invites/<int:invite_id>", views.invite_detail),
+    path("plans", views.plans),
+    path("plans/<int:plan_id>", views.plan_detail),
+    path("subscriptions", views.subscriptions),
+    path("subscriptions/<int:tenant_id>", views.subscription_detail),
+    path("plan-changes", views.plan_changes),
+    path("plan-changes/<int:change_id>/approve", views.plan_change_approve),
+    path("plan-changes/<int:change_id>/reject", views.plan_change_reject),
+    path("payments", views.payments),
+    path("payments/summary", views.payment_summary),
+    path("events", views.events),
+    path("heartbeats", views.heartbeats),
+    path("heartbeats/<int:heartbeat_id>", views.heartbeat_detail),
+    path("system/status", views.system_status),
+    path("", views.api_not_found),
+    path("<path:unmatched>", views.api_not_found),
+]

@@ -19,9 +19,10 @@ valid.
   key (the alpha_pos setup wizard calls this).
 - **`/api/v1/heartbeat`** — bearer-authenticated phone-home; returns the
   current status, expiry, and any banner message.
-- **`/admin/`** — Django admin is the vendor dashboard. Bulk actions
-  (suspend, resume, extend expiry, clear banner message) and an
-  append-only audit trail (`ControlEvent`) are wired up.
+- **`/api/admin/`** — bearer-authenticated vendor API for portfolio triage,
+  tenant/license control, invites, plans, subscriptions, billing review,
+  activity, and service metadata. See [`FRONTEND.md`](FRONTEND.md) for routes.
+- **`/admin/`** — Django admin remains available for direct staff operations.
 - **`generate_vendor_keypair`** / **`generate_unlock`** — management
   commands for the Ed25519 perpetual-unlock escape hatch.
 
@@ -43,7 +44,6 @@ hand its `code` value to an alpha_pos install for the setup wizard.
 ```bash
 DEBUG=True pytest -q
 ```
-~
 ## Why a separate repo / project
 
 alpha_pos ships to every restaurant; this control center is yours

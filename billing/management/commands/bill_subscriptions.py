@@ -14,7 +14,7 @@ Idempotent — safe to run hourly if the operator wants tighter follow-up."""
 from django.core.management.base import BaseCommand
 from django.utils import timezone
 
-from billing.models import Subscription
+from billing.models import BillingRun, Subscription
 from billing.services.billing import resolve, settle
 from billing.services.notifications import (
     send_grace_email, send_lockout_email, send_warn_email,
@@ -76,7 +76,6 @@ class Command(BaseCommand):
                 if send_lockout_email(sub, now=now):
                     lockout_sent += 1
             elif result.in_grace:
-                grace_remaining = result.days_remaining or 0
                 # During grace `days_remaining` is 0 (paid_through is past);
                 # surface the grace remainder instead.
                 grace_left = max(0, sub.grace_days - max(
@@ -88,6 +87,10 @@ class Command(BaseCommand):
                 if send_warn_email(sub, days_remaining=result.days_remaining or 0, now=now):
                     warn_sent += 1
 
+        BillingRun.objects.create(
+            charged_count=charged, warning_count=warn_sent,
+            grace_count=grace_sent, lockout_count=lockout_sent,
+        )
         self.stdout.write(self.style.SUCCESS(
             f'Settled subscriptions; {charged} charged a new period. '
             f'Emails sent: warn={warn_sent} grace={grace_sent} lockout={lockout_sent}.'

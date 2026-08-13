@@ -63,7 +63,9 @@ def _expected_sign(params, *, with_prepare_id: bool) -> str:
         params.get('sign_time', ''),
     ]
     raw = ''.join(str(p) for p in parts)
-    return hashlib.md5(raw.encode('utf-8')).hexdigest()
+    # Click SHOP-API fixes MD5 as the wire-signature algorithm; changing it
+    # would make legitimate provider callbacks unverifiable.
+    return hashlib.md5(raw.encode('utf-8')).hexdigest()  # nosec B324
 
 
 def _signature_ok(params, *, with_prepare_id: bool) -> bool:

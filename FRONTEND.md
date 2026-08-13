@@ -4,11 +4,9 @@ This is the **vendor dashboard** for Alpha POS: where *you* (the vendor) manage 
 restaurants running Alpha POS — their licenses, kill-switch, subscriptions, billing,
 and invites. One control center serves every install (cloud + every till).
 
-> Status today: the backend has **install-facing** APIs (`/api/v1/register`,
-> `/heartbeat`, `/plans`, `/plan-change`) + payment webhooks, and the vendor "dashboard"
-> is currently the **Django admin** at `/admin/`. This doc specifies the **custom
-> dashboard** to build + the **vendor API** it needs (to be implemented alongside).
-> CORS is already open (`CORS_ALLOW_ALL_ORIGINS=True`), so you can develop against it now.
+> Status: the install-facing API, payment webhooks, Django admin, and the bearer-token
+> vendor API under `/api/admin/` are implemented. CORS allows all origins only
+> in development; production origins must be listed in `CORS_ALLOWED_ORIGINS`.
 
 ## Core concepts (the data model)
 
@@ -36,23 +34,27 @@ and invites. One control center serves every install (cloud + every till).
 3. **Tenants** — searchable list (org / email), status chips, create-tenant + issue-invite.
 4. **Tenant detail** — the workhorse: profile + balance; its license keys (status, last
    heartbeat) with per-key Suspend/Resume/Revoke + set-banner; **Suspend ALL / Resume ALL**
-   (account kill-switch); subscription (plan, paid-through, status) + Add-credit; invites;
+   (account kill-switch); subscription (plan, paid-through, status); invites;
    recent heartbeats + events.
 5. **Licenses** — all keys across tenants, filter by status, bulk Suspend/Resume.
 6. **Invites** — list (unused / consumed / expired), create (email, org, expiry), revoke.
 7. **Billing & Subscriptions** — per-tenant subscription + plan-change requests to approve/
-   reject; payment ledger; add credit.
+   reject; read-only payment ledger.
 8. **Plans** — CRUD subscription plans (code, name, price, period_days, warn/grace, active).
 9. **Audit / Heartbeats** — ControlEvent log + a live HeartbeatEvent stream (install health).
 
 (Optional **Settings**: vendor Ed25519 keypair for offline "unlock" files, payment-provider
 keys — these can stay in Django admin for v1.)
 
-## Vendor API contract (to implement; suggested REST under `/api/admin/`)
+## Vendor API contract (implemented under `/api/admin/`)
 
-All token-authed (`Authorization: Bearer <vendor-token>`); JSON. Suggested shape:
+All routes below require `Authorization: Bearer <vendor-access-token>` and return JSON.
+Mutations accept `Idempotency-Key`. Access tokens live for 15 minutes by default and
+refresh tokens rotate on use.
 
 ```
+POST   /api/admin/auth/login|refresh|logout
+GET    /api/admin/auth/me
 GET    /api/admin/overview                      -> KPI counts + recent events
 GET    /api/admin/tenants?q=&status=            -> paginated tenants
 POST   /api/admin/tenants                       -> create tenant
@@ -60,16 +62,23 @@ GET    /api/admin/tenants/{id}                  -> tenant + keys + subscription 
 PATCH  /api/admin/tenants/{id}                  -> edit (org_name, notes)
 POST   /api/admin/tenants/{id}/suspend          -> SUSPEND ALL keys (account kill-switch)
 POST   /api/admin/tenants/{id}/resume           -> RESUME ALL keys
-POST   /api/admin/tenants/{id}/credit           -> add prepaid balance {amount}
-GET    /api/admin/licenses?status=&tenant=      -> license keys
+GET    /api/admin/licenses?status=&health=&tenant= -> license keys
 POST   /api/admin/licenses/{id}/suspend|resume|revoke
 POST   /api/admin/licenses/{id}/message         -> {message} banner shown on the POS
-GET/POST/DELETE /api/admin/invites              -> manage invite codes
+DELETE /api/admin/licenses/{id}/message         -> clear banner
+POST   /api/admin/licenses/bulk-action
+GET/POST /api/admin/invites ; GET/DELETE /api/admin/invites/{id}
 GET    /api/admin/plans ; POST/PATCH/DELETE     -> subscription plans
-GET    /api/admin/subscriptions/{tenant}        -> subscription + plan-change requests
+GET    /api/admin/subscriptions ; GET/PATCH /api/admin/subscriptions/{tenant}
+GET    /api/admin/plan-changes?status=PENDING
 POST   /api/admin/plan-changes/{id}/approve|reject
+GET    /api/admin/payments ; /api/admin/payments/summary
 GET    /api/admin/heartbeats?tenant= ; /api/admin/events?tenant=
+GET    /api/admin/system/status
 ```
+
+Manual browser/admin credits are intentionally unavailable. Click.uz and Payme.uz are
+the only wallet-credit rails; payment rows and control events remain append-only.
 
 (The per-tenant suspend/resume already exists in the Django admin as the
 `suspend_tenant`/`resume_tenant` actions — the API just exposes the same logic.)

@@ -5,6 +5,8 @@ from django.utils import timezone
 from billing.models import (
     Payment, PlanChangeRequest, Subscription, SubscriptionPlan,
 )
+from billing.services.billing import bind_plan_to_subscription
+from licenses.models import ControlEvent
 
 
 @admin.register(SubscriptionPlan)
@@ -20,6 +22,11 @@ class SubscriptionPlanAdmin(admin.ModelAdmin):
     list_filter = ('is_active',)
     search_fields = ('code', 'name', 'description')
     ordering = ('sort_order', 'price')
+
+    def has_delete_permission(self, request, obj=None):
+        # Catalog rows are retired with is_active=False so historical
+        # subscriptions and plan-change requests keep their source plan.
+        return False
 
 
 @admin.register(PlanChangeRequest)
@@ -44,6 +51,9 @@ class PlanChangeRequestAdmin(admin.ModelAdmin):
         # create them by hand — that bypasses the customer's consent.
         return False
 
+    def has_delete_permission(self, request, obj=None):
+        return False
+
     @admin.action(description='Approve plan change')
     def approve_selected(self, request, queryset):
         applied = 0
@@ -58,13 +68,22 @@ class PlanChangeRequestAdmin(admin.ModelAdmin):
                 if sub is None:
                     # Tenant lost its subscription somehow — recreate from plan.
                     sub = Subscription(tenant=req.tenant)
-                _bind_plan_to_subscription(sub, req.requested_plan)
+                bind_plan_to_subscription(sub, req.requested_plan)
                 sub.save()
 
                 req.status = PlanChangeRequest.Status.APPROVED
                 req.decided_at = timezone.now()
                 req.decided_by = request.user
                 req.save(update_fields=['status', 'decided_at', 'decided_by'])
+                ControlEvent.objects.create(
+                    actor=request.user,
+                    action=ControlEvent.Action.PLAN_CHANGE_APPROVE,
+                    tenant=req.tenant,
+                    metadata={
+                        'plan_change_id': req.pk,
+                        'requested_plan_id': req.requested_plan_id,
+                    },
+                )
                 applied += 1
         self.message_user(
             request,
@@ -74,28 +93,40 @@ class PlanChangeRequestAdmin(admin.ModelAdmin):
 
     @admin.action(description='Reject plan change')
     def reject_selected(self, request, queryset):
-        rejected = queryset.filter(
-            status=PlanChangeRequest.Status.PENDING,
-        ).update(
-            status=PlanChangeRequest.Status.REJECTED,
-            decided_at=timezone.now(),
-            decided_by=request.user,
-        )
+        # Rebuild from IDs before locking. The admin changelist queryset may
+        # contain nullable select_related joins, which PostgreSQL cannot lock
+        # with FOR UPDATE.
+        selected_ids = list(queryset.values_list('pk', flat=True))
+        with transaction.atomic():
+            pending = list(
+                PlanChangeRequest.objects.select_for_update()
+                .select_related('tenant')
+                .filter(
+                    pk__in=selected_ids,
+                    status=PlanChangeRequest.Status.PENDING,
+                )
+            )
+            rejected = PlanChangeRequest.objects.filter(
+                pk__in=[row.pk for row in pending],
+            ).update(
+                status=PlanChangeRequest.Status.REJECTED,
+                decided_at=timezone.now(),
+                decided_by=request.user,
+            )
+            ControlEvent.objects.bulk_create([
+                ControlEvent(
+                    actor=request.user,
+                    action=ControlEvent.Action.PLAN_CHANGE_REJECT,
+                    tenant=row.tenant,
+                    metadata={
+                        'plan_change_id': row.pk,
+                        'requested_plan_id': row.requested_plan_id,
+                    },
+                ) for row in pending
+            ])
         self.message_user(
             request, f'Rejected {rejected} plan change(s).', messages.SUCCESS,
         )
-
-
-def _bind_plan_to_subscription(sub: Subscription, plan: SubscriptionPlan) -> None:
-    """Copy a plan's pricing fields onto a Subscription. Shared between the
-    wizard-time bind (register endpoint) and the vendor-approve action so
-    both paths produce identical rows."""
-    sub.plan = plan
-    sub.price = plan.price
-    sub.period_days = plan.period_days
-    sub.warn_days = plan.warn_days
-    sub.grace_days = plan.grace_days
-    sub.status = Subscription.Status.ACTIVE
 
 
 @admin.register(Subscription)
@@ -134,6 +165,9 @@ class SubscriptionAdmin(admin.ModelAdmin):
         ('Lifecycle', {'fields': ('created_at', 'updated_at'), 'classes': ('collapse',)}),
     )
 
+    def has_delete_permission(self, request, obj=None):
+        return False
+
 
 @admin.register(Payment)
 class PaymentAdmin(admin.ModelAdmin):
@@ -154,4 +188,7 @@ class PaymentAdmin(admin.ModelAdmin):
         return False
 
     def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
         return False

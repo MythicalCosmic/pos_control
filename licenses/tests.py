@@ -3,7 +3,7 @@ helper. Heartbeat tests come with the heartbeat endpoint commit."""
 import json
 
 import pytest
-from django.test import Client
+from django.test import Client, override_settings
 
 
 pytestmark = pytest.mark.django_db
@@ -150,16 +150,18 @@ class TestRegisterRejections:
 
 
 class TestRegisterIdempotencyOnRetry:
-    """A retried /register (network blip) must not double-burn the invite."""
+    """A known account may register multiple independent installs."""
 
-    def test_double_register_email_only_returns_403_on_second(self, bound_invite_code):
+    def test_second_email_login_issues_an_additional_install(self, bound_invite_code):
         first = _register({'email': 'plov@example.com'})
         assert first.status_code == 201
-        # Invite is now consumed; second call finds none unconsumed → 403.
         second = _register({'email': 'plov@example.com'})
-        assert second.status_code == 403
+        assert second.status_code == 201
+        assert second.json()['tenant_id'] == first.json()['tenant_id']
+        from licenses.models import LicenseKey
+        assert LicenseKey.objects.filter(tenant_id=first.json()['tenant_id']).count() == 2
 
-    def test_double_register_with_code_returns_409_on_second(self, invite_code):
+    def test_consumed_code_is_ignored_for_existing_account_login(self, invite_code):
         first = _register({
             'email': 'a@b.local', 'org_name': 'A',
             'invite_code': invite_code.code,
@@ -170,7 +172,8 @@ class TestRegisterIdempotencyOnRetry:
             'email': 'a@b.local', 'org_name': 'A',
             'invite_code': invite_code.code,
         })
-        assert second.status_code == 409
+        assert second.status_code == 201
+        assert second.json()['tenant_id'] == first.json()['tenant_id']
 
 
 class TestKeyLookup:
@@ -368,6 +371,44 @@ class TestHeartbeatRecording:
         resp = _heartbeat(key, body='this is a string')  # type: ignore[arg-type]
         # heartbeat() requires a dict; pass a list directly to exercise
         # the json.loads -> dict guard.
+        assert resp.status_code == 200
+        event = row.heartbeat_events.latest('received_at')
+        assert event.payload == {}
+
+    def test_untrusted_forwarded_ip_is_ignored(self, db):
+        from licenses.models import LicenseKey
+        from tenants.models import Tenant
+
+        tenant = Tenant.objects.create(org_name='X', email='ip@x.local')
+        row, key = LicenseKey.issue(tenant)
+        response = _client().post(
+            '/api/v1/heartbeat',
+            data=json.dumps({}),
+            content_type='application/json',
+            HTTP_AUTHORIZATION=f'Bearer {key}',
+            HTTP_X_FORWARDED_FOR='198.51.100.9',
+            REMOTE_ADDR='203.0.113.7',
+        )
+        assert response.status_code == 200
+        assert row.heartbeat_events.latest('received_at').ip == '203.0.113.7'
+
+    @override_settings(TRUST_FORWARDED_FOR=True)
+    def test_trusted_forwarded_ip_uses_rightmost_valid_address(self, db):
+        from licenses.models import LicenseKey
+        from tenants.models import Tenant
+
+        tenant = Tenant.objects.create(org_name='X', email='proxy@x.local')
+        row, key = LicenseKey.issue(tenant)
+        response = _client().post(
+            '/api/v1/heartbeat',
+            data=json.dumps({}),
+            content_type='application/json',
+            HTTP_AUTHORIZATION=f'Bearer {key}',
+            HTTP_X_FORWARDED_FOR='198.51.100.9, 203.0.113.7',
+            REMOTE_ADDR='192.0.2.1',
+        )
+        assert response.status_code == 200
+        assert row.heartbeat_events.latest('received_at').ip == '203.0.113.7'
 
 
 # ---------------------------------------------------------------------------

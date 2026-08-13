@@ -7,141 +7,155 @@ suspend/resume + banner-message admin actions.
 
 Plan: /home/cosmic/.claude/plans/kind-gliding-kay.md
 """
+
 import os
 from pathlib import Path
 
+from django.core.exceptions import ImproperlyConfigured
+from corsheaders.defaults import default_headers
+
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-DEBUG = os.environ.get('DEBUG', 'False').lower() in ('true', '1', 'yes')
+DEBUG = os.environ.get("DEBUG", "False").lower() in ("true", "1", "yes")
 
 # Mirror the alpha_pos pattern: dev-only fallback SECRET_KEY, hard-fail in
 # production. The control center holds every customer's license key hash;
 # losing the SECRET_KEY would not directly leak keys (they're sha256'd),
 # but it's still the cookie-signing key for the Django admin.
-SECRET_KEY = os.environ.get('SECRET_KEY')
+SECRET_KEY = os.environ.get("SECRET_KEY")
 if not SECRET_KEY:
     if DEBUG:
-        SECRET_KEY = 'django-insecure-dev-only-control-center-key'
+        SECRET_KEY = "django-insecure-dev-only-control-center-key"
     else:
-        from django.core.exceptions import ImproperlyConfigured
         raise ImproperlyConfigured(
-            'SECRET_KEY environment variable must be set when DEBUG is False.'
+            "SECRET_KEY environment variable must be set when DEBUG is False."
         )
 
 if DEBUG:
-    ALLOWED_HOSTS = ['*']
+    ALLOWED_HOSTS = ["*"]
 else:
-    ALLOWED_HOSTS = os.environ.get('ALLOWED_HOSTS', 'localhost,127.0.0.1').split(',')
+    ALLOWED_HOSTS = os.environ.get("ALLOWED_HOSTS", "localhost,127.0.0.1").split(",")
 
 
 INSTALLED_APPS = [
-    'django.contrib.admin',
-    'django.contrib.auth',
-    'django.contrib.contenttypes',
-    'django.contrib.sessions',
-    'django.contrib.messages',
-    'django.contrib.staticfiles',
-    'corsheaders',
-    'tenants',
-    'licenses',
-    'billing',
+    "django.contrib.admin",
+    "django.contrib.auth",
+    "django.contrib.contenttypes",
+    "django.contrib.sessions",
+    "django.contrib.messages",
+    "django.contrib.staticfiles",
+    "corsheaders",
+    "tenants",
+    "licenses",
+    "billing",
+    "vendor_api",
 ]
 
 MIDDLEWARE = [
     # CORS first (before any response-generating middleware) so the control-center
     # API answers cross-origin calls from the dashboard frontend.
-    'corsheaders.middleware.CorsMiddleware',
-    'django.middleware.security.SecurityMiddleware',
+    "corsheaders.middleware.CorsMiddleware",
+    "django.middleware.security.SecurityMiddleware",
     # Serves admin static files in production without a separate web server.
     # Must sit directly after SecurityMiddleware per WhiteNoise docs.
-    'whitenoise.middleware.WhiteNoiseMiddleware',
-    'django.contrib.sessions.middleware.SessionMiddleware',
-    'django.middleware.common.CommonMiddleware',
-    'django.middleware.csrf.CsrfViewMiddleware',
-    'django.contrib.auth.middleware.AuthenticationMiddleware',
-    'django.contrib.messages.middleware.MessageMiddleware',
-    'django.middleware.clickjacking.XFrameOptionsMiddleware',
+    "whitenoise.middleware.WhiteNoiseMiddleware",
+    "django.contrib.sessions.middleware.SessionMiddleware",
+    "django.middleware.common.CommonMiddleware",
+    "django.middleware.csrf.CsrfViewMiddleware",
+    "django.contrib.auth.middleware.AuthenticationMiddleware",
+    "django.contrib.messages.middleware.MessageMiddleware",
+    "django.middleware.clickjacking.XFrameOptionsMiddleware",
 ]
 
-# CORS — fully open for the control-center dashboard frontend. Allow-all is the
-# browser-safe combo for a TOKEN-auth client (credentialed CORS stays off). If the
-# dashboard uses cookie/session auth instead, replace allow-all with an explicit
-# CORS_ALLOWED_ORIGINS list and set CORS_ALLOW_CREDENTIALS = True.
-CORS_ALLOW_ALL_ORIGINS = True
+# CORS is open in local development only. Production is fail-closed unless the
+# dashboard origins are explicitly configured; same-origin clients need no entry.
+CORS_ALLOW_ALL_ORIGINS = DEBUG or os.environ.get(
+    "CORS_ALLOW_ALL_ORIGINS",
+    "False",
+).lower() in ("true", "1", "yes")
+CORS_ALLOWED_ORIGINS = [
+    origin.strip()
+    for origin in os.environ.get("CORS_ALLOWED_ORIGINS", "").split(",")
+    if origin.strip()
+]
 CORS_ALLOW_CREDENTIALS = False
+CORS_ALLOW_HEADERS = (*default_headers, "idempotency-key")
+CORS_EXPOSE_HEADERS = ["Retry-After"]
 
-ROOT_URLCONF = 'pos_control_center.urls'
+ROOT_URLCONF = "pos_control_center.urls"
 
 TEMPLATES = [
     {
-        'BACKEND': 'django.template.backends.django.DjangoTemplates',
-        'DIRS': [],
-        'APP_DIRS': True,
-        'OPTIONS': {
-            'context_processors': [
-                'django.template.context_processors.request',
-                'django.contrib.auth.context_processors.auth',
-                'django.contrib.messages.context_processors.messages',
+        "BACKEND": "django.template.backends.django.DjangoTemplates",
+        "DIRS": [],
+        "APP_DIRS": True,
+        "OPTIONS": {
+            "context_processors": [
+                "django.template.context_processors.request",
+                "django.contrib.auth.context_processors.auth",
+                "django.contrib.messages.context_processors.messages",
             ],
         },
     },
 ]
 
-WSGI_APPLICATION = 'pos_control_center.wsgi.application'
+WSGI_APPLICATION = "pos_control_center.wsgi.application"
 
 
 # SQLite locally; Postgres in production via DB_ENGINE=django.db.backends.postgresql.
 # CONN_MAX_AGE keeps the connection warm between requests instead of
 # reconnecting on every heartbeat — drops a noticeable chunk of p95 latency.
-if os.environ.get('DB_ENGINE'):
+if os.environ.get("DB_ENGINE"):
     DATABASES = {
-        'default': {
-            'ENGINE': os.environ['DB_ENGINE'],
-            'NAME': os.environ.get('DB_NAME', 'pos_control_center'),
-            'USER': os.environ.get('DB_USER', 'pos_control_center'),
-            'PASSWORD': os.environ.get('DB_PASSWORD', ''),
-            'HOST': os.environ.get('DB_HOST', 'db'),
-            'PORT': os.environ.get('DB_PORT', '5432'),
-            'CONN_MAX_AGE': int(os.environ.get('DB_CONN_MAX_AGE', '60')),
-            'CONN_HEALTH_CHECKS': True,
+        "default": {
+            "ENGINE": os.environ["DB_ENGINE"],
+            "NAME": os.environ.get("DB_NAME", "pos_control_center"),
+            "USER": os.environ.get("DB_USER", "pos_control_center"),
+            "PASSWORD": os.environ.get("DB_PASSWORD", ""),
+            "HOST": os.environ.get("DB_HOST", "db"),
+            "PORT": os.environ.get("DB_PORT", "5432"),
+            "CONN_MAX_AGE": int(os.environ.get("DB_CONN_MAX_AGE", "60")),
+            "CONN_HEALTH_CHECKS": True,
         }
     }
 else:
     DATABASES = {
-        'default': {
-            'ENGINE': 'django.db.backends.sqlite3',
-            'NAME': BASE_DIR / 'db.sqlite3',
+        "default": {
+            "ENGINE": "django.db.backends.sqlite3",
+            "NAME": BASE_DIR / "db.sqlite3",
         }
     }
 
 
 AUTH_PASSWORD_VALIDATORS = [
-    {'NAME': 'django.contrib.auth.password_validation.UserAttributeSimilarityValidator'},
-    {'NAME': 'django.contrib.auth.password_validation.MinimumLengthValidator'},
-    {'NAME': 'django.contrib.auth.password_validation.CommonPasswordValidator'},
-    {'NAME': 'django.contrib.auth.password_validation.NumericPasswordValidator'},
+    {
+        "NAME": "django.contrib.auth.password_validation.UserAttributeSimilarityValidator"
+    },
+    {"NAME": "django.contrib.auth.password_validation.MinimumLengthValidator"},
+    {"NAME": "django.contrib.auth.password_validation.CommonPasswordValidator"},
+    {"NAME": "django.contrib.auth.password_validation.NumericPasswordValidator"},
 ]
 
-LANGUAGE_CODE = 'en-us'
-TIME_ZONE = 'UTC'
+LANGUAGE_CODE = "en-us"
+TIME_ZONE = "UTC"
 USE_I18N = True
 USE_TZ = True
 
-STATIC_URL = 'static/'
-STATIC_ROOT = BASE_DIR / 'staticfiles'
+STATIC_URL = "static/"
+STATIC_ROOT = BASE_DIR / "staticfiles"
 
 # WhiteNoise: hashed + gzip/brotli-compressed static files so the admin
 # dashboard loads its CSS/JS straight from gunicorn.
 STORAGES = {
-    'default': {
-        'BACKEND': 'django.core.files.storage.FileSystemStorage',
+    "default": {
+        "BACKEND": "django.core.files.storage.FileSystemStorage",
     },
-    'staticfiles': {
-        'BACKEND': 'whitenoise.storage.CompressedManifestStaticFilesStorage',
+    "staticfiles": {
+        "BACKEND": "whitenoise.storage.CompressedManifestStaticFilesStorage",
     },
 }
 
-DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 # Production hardening — matches the patterns used by alpha_pos.
 if not DEBUG:
@@ -152,17 +166,19 @@ if not DEBUG:
     CSRF_COOKIE_SECURE = True
     SECURE_BROWSER_XSS_FILTER = True
     SECURE_CONTENT_TYPE_NOSNIFF = True
-    SECURE_REFERRER_POLICY = 'same-origin'
-    X_FRAME_OPTIONS = 'DENY'
+    SECURE_REFERRER_POLICY = "same-origin"
+    X_FRAME_OPTIONS = "DENY"
     # Only redirect to HTTPS when explicitly opted in, so a reverse-proxy
     # deployment (the typical one) doesn't end up in a redirect loop.
-    SECURE_SSL_REDIRECT = os.environ.get(
-        'SECURE_SSL_REDIRECT', 'False'
-    ).lower() in ('true', '1', 'yes')
+    SECURE_SSL_REDIRECT = os.environ.get("SECURE_SSL_REDIRECT", "False").lower() in (
+        "true",
+        "1",
+        "yes",
+    )
     # Trust X-Forwarded-Proto from a known-good reverse proxy terminating TLS.
     # Configure only when actually behind such a proxy.
-    if os.environ.get('TRUST_FORWARDED_PROTO', '').lower() in ('true', '1', 'yes'):
-        SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+    if os.environ.get("TRUST_FORWARDED_PROTO", "").lower() in ("true", "1", "yes"):
+        SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
 
 SESSION_COOKIE_HTTPONLY = True
 CSRF_COOKIE_HTTPONLY = True
@@ -171,29 +187,31 @@ CSRF_COOKIE_HTTPONLY = True
 # this list. Set to the dashboard's public origin(s) when serving over HTTPS
 # behind a proxy, e.g. CSRF_TRUSTED_ORIGINS=https://control.example.com
 CSRF_TRUSTED_ORIGINS = [
-    o.strip() for o in os.environ.get('CSRF_TRUSTED_ORIGINS', '').split(',') if o.strip()
+    o.strip()
+    for o in os.environ.get("CSRF_TRUSTED_ORIGINS", "").split(",")
+    if o.strip()
 ]
 
 # Logging: console handler so register/heartbeat logger.exception() output
 # lands in `docker logs` (and journald / systemd) rather than being swallowed.
 LOGGING = {
-    'version': 1,
-    'disable_existing_loggers': False,
-    'formatters': {
-        'standard': {
-            'format': '{asctime} {levelname} {name}: {message}',
-            'style': '{',
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {
+        "standard": {
+            "format": "{asctime} {levelname} {name}: {message}",
+            "style": "{",
         },
     },
-    'handlers': {
-        'console': {
-            'class': 'logging.StreamHandler',
-            'formatter': 'standard',
+    "handlers": {
+        "console": {
+            "class": "logging.StreamHandler",
+            "formatter": "standard",
         },
     },
-    'root': {
-        'handlers': ['console'],
-        'level': os.environ.get('LOG_LEVEL', 'INFO'),
+    "root": {
+        "handlers": ["console"],
+        "level": os.environ.get("LOG_LEVEL", "INFO"),
     },
 }
 
@@ -202,21 +220,54 @@ LOGGING = {
 # production this should live in a hardware vault, NOT on the control-
 # center server — the dashboard's "Generate perpetual unlock" action
 # accepts the signed file pasted in, it does not sign on-the-fly.
-LICENSE_VENDOR_PRIVATE_KEY = os.environ.get('LICENSE_VENDOR_PRIVATE_KEY', '')
+LICENSE_VENDOR_PRIVATE_KEY = os.environ.get("LICENSE_VENDOR_PRIVATE_KEY", "")
 
 # Public counterpart — embedded in every alpha_pos build so installs can
 # verify unlock signatures. Surfaced here only for the dashboard to
 # display alongside generated unlock files.
-LICENSE_VENDOR_PUBLIC_KEY = os.environ.get('LICENSE_VENDOR_PUBLIC_KEY', '')
+LICENSE_VENDOR_PUBLIC_KEY = os.environ.get("LICENSE_VENDOR_PUBLIC_KEY", "")
 
 # --- Payment providers (top-ups credit the tenant's prepaid balance) ---
 # All credits flow in through the payment provider webhooks — the control
 # center has no manual top-up form. Click.uz merchant credentials:
-CLICK_SERVICE_ID = os.environ.get('CLICK_SERVICE_ID', '')
-CLICK_MERCHANT_ID = os.environ.get('CLICK_MERCHANT_ID', '')
-CLICK_SECRET_KEY = os.environ.get('CLICK_SECRET_KEY', '')
+CLICK_SERVICE_ID = os.environ.get("CLICK_SERVICE_ID", "")
+CLICK_MERCHANT_ID = os.environ.get("CLICK_MERCHANT_ID", "")
+CLICK_SECRET_KEY = os.environ.get("CLICK_SECRET_KEY", "")
 # Payme.uz (Paycom) merchant key:
-PAYME_MERCHANT_KEY = os.environ.get('PAYME_MERCHANT_KEY', '')
+PAYME_MERCHANT_KEY = os.environ.get("PAYME_MERCHANT_KEY", "")
+
+# Vendor API policy. Heartbeat health is centralized here so portfolio views,
+# filtering, and alerting all use the same definition.
+HEARTBEAT_ONLINE_MINUTES = int(os.environ.get("HEARTBEAT_ONLINE_MINUTES", "10"))
+HEARTBEAT_DELAYED_MINUTES = int(os.environ.get("HEARTBEAT_DELAYED_MINUTES", "30"))
+VENDOR_ACCESS_TOKEN_SECONDS = int(os.environ.get("VENDOR_ACCESS_TOKEN_SECONDS", "900"))
+VENDOR_REFRESH_TOKEN_SECONDS = int(
+    os.environ.get("VENDOR_REFRESH_TOKEN_SECONDS", "604800")
+)
+VENDOR_LOGIN_WINDOW_SECONDS = int(os.environ.get("VENDOR_LOGIN_WINDOW_SECONDS", "900"))
+VENDOR_LOGIN_MAX_ATTEMPTS = int(os.environ.get("VENDOR_LOGIN_MAX_ATTEMPTS", "5"))
+VENDOR_API_PAGE_SIZE = int(os.environ.get("VENDOR_API_PAGE_SIZE", "50"))
+VENDOR_API_MAX_PAGE_SIZE = int(os.environ.get("VENDOR_API_MAX_PAGE_SIZE", "200"))
+DEPLOYMENT_VERSION = os.environ.get("DEPLOYMENT_VERSION", "")
+TRUST_FORWARDED_FOR = os.environ.get(
+    "TRUST_FORWARDED_FOR",
+    "False",
+).lower() in ("true", "1", "yes")
+
+if not 0 < HEARTBEAT_ONLINE_MINUTES < HEARTBEAT_DELAYED_MINUTES:
+    raise ImproperlyConfigured(
+        "Heartbeat thresholds must satisfy 0 < online < delayed."
+    )
+if not 0 < VENDOR_ACCESS_TOKEN_SECONDS <= VENDOR_REFRESH_TOKEN_SECONDS:
+    raise ImproperlyConfigured(
+        "Vendor token lifetimes must satisfy 0 < access <= refresh."
+    )
+if VENDOR_LOGIN_WINDOW_SECONDS <= 0 or VENDOR_LOGIN_MAX_ATTEMPTS <= 0:
+    raise ImproperlyConfigured("Vendor login throttling values must be positive.")
+if not 0 < VENDOR_API_PAGE_SIZE <= VENDOR_API_MAX_PAGE_SIZE:
+    raise ImproperlyConfigured(
+        "Vendor pagination must satisfy 0 < default page size <= maximum."
+    )
 
 
 # --- Email (warning + lockout notifications) ----------------------------------
@@ -224,21 +275,26 @@ PAYME_MERCHANT_KEY = os.environ.get('PAYME_MERCHANT_KEY', '')
 # development the console backend prints emails to stdout; in production set
 # EMAIL_HOST / EMAIL_HOST_USER / EMAIL_HOST_PASSWORD via env and the SMTP
 # backend takes over automatically.
-EMAIL_HOST = os.environ.get('EMAIL_HOST', '')
+EMAIL_HOST = os.environ.get("EMAIL_HOST", "")
 if EMAIL_HOST:
-    EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
-    EMAIL_PORT = int(os.environ.get('EMAIL_PORT', '587'))
-    EMAIL_HOST_USER = os.environ.get('EMAIL_HOST_USER', '')
-    EMAIL_HOST_PASSWORD = os.environ.get('EMAIL_HOST_PASSWORD', '')
-    EMAIL_USE_TLS = os.environ.get('EMAIL_USE_TLS', 'True').lower() in (
-        'true', '1', 'yes',
+    EMAIL_BACKEND = "django.core.mail.backends.smtp.EmailBackend"
+    EMAIL_PORT = int(os.environ.get("EMAIL_PORT", "587"))
+    EMAIL_HOST_USER = os.environ.get("EMAIL_HOST_USER", "")
+    EMAIL_HOST_PASSWORD = os.environ.get("EMAIL_HOST_PASSWORD", "")
+    EMAIL_USE_TLS = os.environ.get("EMAIL_USE_TLS", "True").lower() in (
+        "true",
+        "1",
+        "yes",
     )
-    EMAIL_USE_SSL = os.environ.get('EMAIL_USE_SSL', 'False').lower() in (
-        'true', '1', 'yes',
+    EMAIL_USE_SSL = os.environ.get("EMAIL_USE_SSL", "False").lower() in (
+        "true",
+        "1",
+        "yes",
     )
-    EMAIL_TIMEOUT = int(os.environ.get('EMAIL_TIMEOUT', '15'))
+    EMAIL_TIMEOUT = int(os.environ.get("EMAIL_TIMEOUT", "15"))
 else:
-    EMAIL_BACKEND = 'django.core.mail.backends.console.EmailBackend'
+    EMAIL_BACKEND = "django.core.mail.backends.console.EmailBackend"
 DEFAULT_FROM_EMAIL = os.environ.get(
-    'DEFAULT_FROM_EMAIL', 'POS Control Center <noreply@control.local>',
+    "DEFAULT_FROM_EMAIL",
+    "POS Control Center <noreply@control.local>",
 )

@@ -20,4 +20,5 @@ urlpatterns = [
     path('api/v1/', include('licenses.urls')),
     # Payment-provider webhooks (Click.uz / Payme.uz top-ups).
     path('api/billing/', include('billing.urls')),
+    path('api/admin/', include('vendor_api.urls')),
 ]

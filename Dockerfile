@@ -12,17 +12,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Build deps in a throwaway layer: compile the wheels, then purge the
-# toolchain so the final image stays small.
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential \
-        libpq-dev \
-    && true
-
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt \
-    && apt-get purge -y --auto-remove build-essential libpq-dev \
-    && rm -rf /var/lib/apt/lists/*
+# Every pinned dependency publishes a Python 3.13 Linux wheel, including
+# psycopg2-binary and cryptography, so a compiler toolchain is unnecessary.
+# Keeping it out makes the runtime image smaller and reduces build surface.
+RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 

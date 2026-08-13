@@ -107,6 +107,27 @@ class TestResolve:
         assert result.status == 'ACTIVE'
         assert result.days_remaining is None
 
+    def test_canceled_subscription_honors_only_an_existing_paid_period(self):
+        now = timezone.now()
+        active_tenant = _tenant(email='paid-canceled@x.local')
+        Subscription.objects.create(
+            tenant=active_tenant,
+            status=Subscription.Status.CANCELED,
+            price=Decimal('30'),
+            paid_through=now + timedelta(days=2),
+        )
+        active = resolve(active_tenant, now=now)
+        assert active.status == 'ACTIVE'
+        assert active.warn is False
+
+        expired_tenant = _tenant(email='free-canceled@x.local')
+        Subscription.objects.create(
+            tenant=expired_tenant,
+            status=Subscription.Status.CANCELED,
+            price=Decimal('0'),
+        )
+        assert resolve(expired_tenant, now=now).status == 'EXPIRED'
+
     def test_no_subscription_is_active(self):
         t = _tenant()
         result = resolve(t)

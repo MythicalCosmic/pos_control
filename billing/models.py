@@ -221,7 +221,7 @@ class Payment(models.Model):
         SYSTEM = 'SYSTEM', 'System (subscription charge)'
 
     tenant = models.ForeignKey(
-        'tenants.Tenant', on_delete=models.CASCADE, related_name='payments',
+        'tenants.Tenant', on_delete=models.PROTECT, related_name='payments',
     )
     # Positive for money in (TOPUP), positive for money out too — the `kind`
     # disambiguates direction. balance_after is the source of truth for sign.
@@ -264,6 +264,18 @@ class Payment(models.Model):
 
     def __str__(self):
         return f'Payment<{self.kind} {self.amount} {self.tenant.org_name} → {self.balance_after}>'
+
+
+class BillingRun(models.Model):
+    """Successful completion record for the scheduled billing job."""
+    completed_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    charged_count = models.PositiveIntegerField(default=0)
+    warning_count = models.PositiveIntegerField(default=0)
+    grace_count = models.PositiveIntegerField(default=0)
+    lockout_count = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        ordering = ['-completed_at']
 
 
 class ClickTransaction(models.Model):

@@ -17,7 +17,13 @@ HOST="control.${IP}.nip.io"
 
 echo ">> POS Control Center  ->  https://${HOST}"
 
-git -C "$DIR" pull --ff-only 2>/dev/null || echo "   (skipping pull)"
+if git -C "$DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    # A failed update must stop the deployment instead of silently rebuilding
+    # and restarting an unknown stale revision.
+    git -C "$DIR" pull --ff-only
+else
+    echo "   (not a git checkout; skipping pull)"
+fi
 
 docker network inspect edge >/dev/null 2>&1 || docker network create edge
 
@@ -26,6 +32,21 @@ rand() { head -c "${1:-48}" /dev/urandom | base64 | tr -d '\n' | tr '+/' '-_' | 
 keep() { [ -f "$DIR/.env" ] && sed -n "s/^$1=//p" "$DIR/.env" | head -n1 || true; }
 SECRET="$(keep SECRET_KEY)";   SECRET="${SECRET:-$(rand 64)}"
 DBPASS="$(keep DB_PASSWORD)";  DBPASS="${DBPASS:-$(rand 32)}"
+ADMINPASS="$(keep DJANGO_ADMIN_PASSWORD)"; ADMINPASS="${ADMINPASS:-$(rand 32)}"
+CORS_ORIGINS="$(keep CORS_ALLOWED_ORIGINS)"; CORS_ORIGINS="${CORS_ORIGINS:-https://${HOST}}"
+ACCESS_SECONDS="$(keep VENDOR_ACCESS_TOKEN_SECONDS)"; ACCESS_SECONDS="${ACCESS_SECONDS:-900}"
+REFRESH_SECONDS="$(keep VENDOR_REFRESH_TOKEN_SECONDS)"; REFRESH_SECONDS="${REFRESH_SECONDS:-604800}"
+LOGIN_WINDOW="$(keep VENDOR_LOGIN_WINDOW_SECONDS)"; LOGIN_WINDOW="${LOGIN_WINDOW:-900}"
+LOGIN_ATTEMPTS="$(keep VENDOR_LOGIN_MAX_ATTEMPTS)"; LOGIN_ATTEMPTS="${LOGIN_ATTEMPTS:-5}"
+PAGE_SIZE="$(keep VENDOR_API_PAGE_SIZE)"; PAGE_SIZE="${PAGE_SIZE:-50}"
+MAX_PAGE_SIZE="$(keep VENDOR_API_MAX_PAGE_SIZE)"; MAX_PAGE_SIZE="${MAX_PAGE_SIZE:-200}"
+ONLINE_MINUTES="$(keep HEARTBEAT_ONLINE_MINUTES)"; ONLINE_MINUTES="${ONLINE_MINUTES:-10}"
+DELAYED_MINUTES="$(keep HEARTBEAT_DELAYED_MINUTES)"; DELAYED_MINUTES="${DELAYED_MINUTES:-30}"
+DEPLOY_VERSION="$(git -C "$DIR" rev-parse --verify HEAD 2>/dev/null || true)"
+CLICK_SERVICE="$(keep CLICK_SERVICE_ID)"
+CLICK_MERCHANT="$(keep CLICK_MERCHANT_ID)"
+CLICK_SECRET="$(keep CLICK_SECRET_KEY)"
+PAYME_KEY="$(keep PAYME_MERCHANT_KEY)"
 # Ed25519 vendor keypair for signing offline "unlock" files (recovery path).
 # Generated once into .env; the public half is what installs verify against.
 VPRIV="$(keep LICENSE_VENDOR_PRIVATE_KEY)"
@@ -44,11 +65,27 @@ DB_HOST=db
 DB_PORT=5432
 WEB_PORT=127.0.0.1:8002
 TRUST_FORWARDED_PROTO=True
+TRUST_FORWARDED_FOR=True
+CORS_ALLOWED_ORIGINS=${CORS_ORIGINS}
+DJANGO_ADMIN_PASSWORD=${ADMINPASS}
+VENDOR_ACCESS_TOKEN_SECONDS=${ACCESS_SECONDS}
+VENDOR_REFRESH_TOKEN_SECONDS=${REFRESH_SECONDS}
+VENDOR_LOGIN_WINDOW_SECONDS=${LOGIN_WINDOW}
+VENDOR_LOGIN_MAX_ATTEMPTS=${LOGIN_ATTEMPTS}
+VENDOR_API_PAGE_SIZE=${PAGE_SIZE}
+VENDOR_API_MAX_PAGE_SIZE=${MAX_PAGE_SIZE}
+HEARTBEAT_ONLINE_MINUTES=${ONLINE_MINUTES}
+HEARTBEAT_DELAYED_MINUTES=${DELAYED_MINUTES}
+DEPLOYMENT_VERSION=${DEPLOY_VERSION}
 LICENSE_VENDOR_PRIVATE_KEY=${VPRIV}
 LICENSE_VENDOR_PUBLIC_KEY=${VPUB}
-# Payment providers (fill when you wire Click.uz / Payme.uz top-ups):
-# CLICK_SERVICE_ID=  CLICK_MERCHANT_ID=  CLICK_SECRET_KEY=  PAYME_MERCHANT_KEY=
+# Payment providers (preserved across deploys; fill in .env when enabled):
+CLICK_SERVICE_ID=${CLICK_SERVICE}
+CLICK_MERCHANT_ID=${CLICK_MERCHANT}
+CLICK_SECRET_KEY=${CLICK_SECRET}
+PAYME_MERCHANT_KEY=${PAYME_KEY}
 EOF
+chmod 600 "$DIR/.env"
 echo ">> wrote .env"
 
 # --- edge overlay: join the app to the shared network as 'control-web' -----
@@ -108,28 +145,28 @@ EOF
 
 # --- admin (the vendor dashboard login; idempotent) -----------------------
 DC="cd \"$DIR\" && docker compose -f docker-compose.yaml -f docker-compose.edge.yml exec -T web python manage.py"
-eval "$DC migrate --noinput" || true
+eval "$DC migrate --noinput"
 # Seed the standard subscription plans (idempotent — never clobbers edited prices)
 # so the setup wizard + desktop licensing/plans page (GET /api/v1/plans) aren't empty.
-eval "$DC seed_plans" || true
-# Django admin users (idempotent): a superuser for /admin/ (the licenses/tenants
-# admin tables) + a normal user, both with password root1234.
-( cd "$DIR" && docker compose -f docker-compose.yaml -f docker-compose.edge.yml exec -T web python manage.py shell ) <<'PYEOF' || true
+eval "$DC seed_plans"
+# Django admin user (idempotent). The generated bootstrap password is stored in
+# the server-side .env and is never printed into deployment logs. Re-deploys
+# reuse that value; the historical root1234 default is rotated on first run.
+( cd "$DIR" && docker compose -f docker-compose.yaml -f docker-compose.edge.yml exec -T web python manage.py shell ) <<'PYEOF'
+import os
 from django.contrib.auth import get_user_model
 U = get_user_model()
 a, _ = U.objects.get_or_create(username='admin', defaults={'email': 'admin@local'})
 a.is_staff = a.is_superuser = a.is_active = True
-a.set_password('root1234'); a.save()
-n, _ = U.objects.get_or_create(username='user', defaults={'email': 'user@local'})
-n.is_active = True
-n.set_password('root1234'); n.save()
-print('Django admin users ready: admin (superuser) + user, password root1234')
+a.set_password(os.environ['DJANGO_ADMIN_PASSWORD'])
+a.save()
+print('Django admin user ready; bootstrap credential is stored in .env')
 PYEOF
 
 echo ""
 echo "============================================================"
 echo "  POS Control Center is up:  https://${HOST}"
-echo "  Django /admin/ login: admin / root1234 (superuser)  +  user / root1234"
+echo "  Django /admin/ login: admin (credential stored server-side in .env)"
 echo "  Vendor dashboard (until the custom UI ships): https://${HOST}/admin/"
 echo "  Point each alpha_pos install at: LICENSE_CONTROL_CENTER_URL=https://${HOST}"
 echo "============================================================"

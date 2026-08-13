@@ -24,8 +24,8 @@ class Tenant(models.Model):
 
     # Prepaid wallet. The subscription charges its price from here once per
     # period (see billing.services). When it can't cover the next period the
-    # heartbeat reports EXPIRED and the POS kill switch fires. Topped up via
-    # the admin "Add credit" action or a payment provider (Click / Payme).
+    # heartbeat reports EXPIRED and the POS kill switch fires. Topped up only
+    # through a payment provider (Click / Payme).
     # Never write this directly outside billing.services — go through
     # credit_balance()/settle() so the Payment ledger stays consistent.
     balance = models.DecimalField(
@@ -89,6 +89,11 @@ class InviteCode(models.Model):
     intended_org_name = models.CharField(max_length=200, blank=True, default='')
 
     notes = models.TextField(blank=True, default='')
+    revoked_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    revoked_by = models.ForeignKey(
+        'auth.User', on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='revoked_invites',
+    )
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -101,8 +106,16 @@ class InviteCode(models.Model):
         if self.expires_at is None:
             return False
         from django.utils import timezone
-        return (now or timezone.now()) > self.expires_at
+        return (now or timezone.now()) >= self.expires_at
+
+    def is_revoked(self) -> bool:
+        return self.revoked_at is not None
 
     def __str__(self):
-        state = 'consumed' if self.is_consumed() else 'unused'
+        if self.is_revoked():
+            state = 'revoked'
+        elif self.is_consumed():
+            state = 'consumed'
+        else:
+            state = 'unused'
         return f'InviteCode<{self.code} {state}>'
