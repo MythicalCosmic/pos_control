@@ -14,6 +14,7 @@ set -euo pipefail
 IP="${1:?Usage: ./deploy.sh <SERVER_PUBLIC_IP>}"
 DIR="$(cd "$(dirname "$0")" && pwd)"
 HOST="control.${IP}.nip.io"
+UI_HOST="control-ui.${IP}.nip.io"
 
 echo ">> POS Control Center  ->  https://${HOST}"
 
@@ -33,7 +34,7 @@ keep() { [ -f "$DIR/.env" ] && sed -n "s/^$1=//p" "$DIR/.env" | head -n1 || true
 SECRET="$(keep SECRET_KEY)";   SECRET="${SECRET:-$(rand 64)}"
 DBPASS="$(keep DB_PASSWORD)";  DBPASS="${DBPASS:-$(rand 32)}"
 ADMINPASS="$(keep DJANGO_ADMIN_PASSWORD)"; ADMINPASS="${ADMINPASS:-$(rand 32)}"
-CORS_ORIGINS="$(keep CORS_ALLOWED_ORIGINS)"; CORS_ORIGINS="${CORS_ORIGINS:-https://${HOST}}"
+CORS_ORIGINS="$(keep CORS_ALLOWED_ORIGINS)"; CORS_ORIGINS="${CORS_ORIGINS:-https://${UI_HOST}}"
 ACCESS_SECONDS="$(keep VENDOR_ACCESS_TOKEN_SECONDS)"; ACCESS_SECONDS="${ACCESS_SECONDS:-900}"
 REFRESH_SECONDS="$(keep VENDOR_REFRESH_TOKEN_SECONDS)"; REFRESH_SECONDS="${REFRESH_SECONDS:-604800}"
 LOGIN_WINDOW="$(keep VENDOR_LOGIN_WINDOW_SECONDS)"; LOGIN_WINDOW="${LOGIN_WINDOW:-900}"

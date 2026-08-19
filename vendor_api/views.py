@@ -690,9 +690,13 @@ def license_bulk_action(request):
         return err
     ids = body.get("ids")
     action = str(body.get("action") or "").upper()
-    err = _reject_unknown_fields(body, {"ids", "action"})
+    reason = body.get("reason") or ""
+    err = _reject_unknown_fields(body, {"ids", "action", "reason"})
     if err:
         return err
+    if not isinstance(reason, str) or len(reason) > 500:
+        return _field_error("reason", "Must be a string of 500 characters or fewer.")
+    reason = reason.strip()
     if not isinstance(ids, list) or not ids or len(ids) > 200:
         return error(
             "validation_error",
@@ -749,7 +753,7 @@ def license_bulk_action(request):
                     action=event_action,
                     tenant=row.tenant,
                     license_key=row,
-                    metadata={"scope": "bulk"},
+                    metadata={"scope": "bulk", "reason": reason},
                 )
                 for row in rows
             ]

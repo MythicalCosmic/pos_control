@@ -348,11 +348,20 @@ class TestTenantAndLicenseControls:
         bulk = post(
             client,
             "/api/admin/licenses/bulk-action",
-            {"ids": [one.pk, two.pk], "action": "SUSPEND"},
+            {
+                "ids": [one.pk, two.pk],
+                "action": "SUSPEND",
+                "reason": "Scheduled branch maintenance",
+            },
             token,
         )
         assert bulk.status_code == 200
         assert bulk.json()["data"]["affected_license_count"] == 2
+        assert ControlEvent.objects.filter(
+            action="SUSPEND",
+            metadata__scope="bulk",
+            metadata__reason="Scheduled branch maintenance",
+        ).count() == 2
         cleared = post(
             client, f"/api/admin/licenses/{one.pk}/message", {}, token, method="delete"
         )
