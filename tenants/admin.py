@@ -1,17 +1,90 @@
-from django.contrib import admin
+from decimal import Decimal, InvalidOperation
+
+from django import forms
+from django.contrib import admin, messages
+from django.contrib.admin.helpers import ActionForm
 from django.utils import timezone
 
 from licenses.models import ControlEvent
 from tenants.models import InviteCode, Tenant
 
 
+class TopUpActionForm(ActionForm):
+    """Collect the amount and audit note for a manual wallet top-up."""
+
+    amount = forms.DecimalField(
+        required=False,
+        max_digits=14,
+        decimal_places=2,
+        label='Top-up amount',
+        min_value=Decimal('0.01'),
+    )
+    note = forms.CharField(required=False, label='Note (optional)')
+
+
 @admin.register(Tenant)
 class TenantAdmin(admin.ModelAdmin):
-    """Tenant profile. Wallet credits are provider-only (Click/Payme)."""
+    """Tenant profile with an audited manual wallet top-up action."""
+
+    action_form = TopUpActionForm
+    actions = ('top_up_balance',)
     list_display = ('org_name', 'email', 'balance', 'created_at')
     search_fields = ('org_name', 'email', 'notes')
     readonly_fields = ('balance', 'created_at', 'updated_at')
     ordering = ('org_name',)
+
+    @admin.action(description='Top up balance (enter amount below)')
+    def top_up_balance(self, request, queryset):
+        """Credit selected tenants through the append-only billing ledger."""
+        from billing.models import Payment
+        from billing.services.billing import credit_balance
+
+        raw_amount = (request.POST.get('amount') or '').strip()
+        if not raw_amount:
+            self.message_user(
+                request,
+                'Enter a value in “Top-up amount” before running this action.',
+                level=messages.ERROR,
+            )
+            return
+
+        try:
+            amount = Decimal(raw_amount)
+        except (InvalidOperation, TypeError):
+            self.message_user(
+                request,
+                f'Invalid top-up amount: {raw_amount!r}.',
+                level=messages.ERROR,
+            )
+            return
+
+        note = (request.POST.get('note') or '').strip() or 'Manual admin top-up'
+        credited = 0
+        for tenant in queryset:
+            try:
+                credit_balance(
+                    tenant,
+                    amount,
+                    source=Payment.Source.MANUAL,
+                    actor=request.user if request.user.is_authenticated else None,
+                    note=note,
+                )
+            except ValueError as exc:
+                self.message_user(
+                    request,
+                    f'{tenant}: {exc}',
+                    level=messages.ERROR,
+                )
+                continue
+            credited += 1
+
+        if credited:
+            self.message_user(
+                request,
+                f'Credited {amount:.2f} to {credited} tenant(s). '
+                'Any overdue subscription was settled automatically.',
+                level=messages.SUCCESS,
+            )
 
     def has_delete_permission(self, request, obj=None):
         # Tenants are durable account records. The control API intentionally
